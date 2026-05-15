@@ -514,3 +514,34 @@ where
             .map_err(serde::de::Error::custom),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::deserialize_optional_f64;
+
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(deserialize_with = "deserialize_optional_f64")]
+        value: Option<f64>,
+    }
+
+    #[test]
+    fn parses_numeric_optional_f64() {
+        let probe: Probe = serde_json::from_str(r#"{"value":"29.015"}"#).unwrap();
+        assert_eq!(probe.value, Some(29.015));
+    }
+
+    #[test]
+    fn parses_missing_tokens_as_none() {
+        for raw in [
+            r#"{"value":"M"}"#,
+            r#"{"value":"VRB"}"#,
+            r#"{"value":null}"#,
+        ] {
+            let probe: Probe = serde_json::from_str(raw).unwrap();
+            assert_eq!(probe.value, None);
+        }
+    }
+}

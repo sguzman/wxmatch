@@ -273,6 +273,10 @@ async fn build_profiles(app: &App, station_id: &StationId, year: Option<i32>) ->
 
 #[instrument(skip(app))]
 async fn query_day(app: &App, station_id: &StationId, date: NaiveDate) -> Result<()> {
+    if date == Local::now().date_naive() {
+        ensure_today_current_data(app, station_id).await?;
+    }
+    ensure_derived(app, station_id, date.year()).await?;
     let daily = load_daily_for_year(app, station_id, date.year())?;
     let profiles = load_profiles_for_year(app, station_id, date.year())?;
     let summary = daily
@@ -304,6 +308,9 @@ async fn query_day(app: &App, station_id: &StationId, date: NaiveDate) -> Result
 async fn query_probability(app: &App, args: ProbabilityArgs) -> Result<()> {
     let target_date = target_date_or_today(args.date, args.today)?;
     let station_id = StationId::new(&args.station);
+    if target_date == Local::now().date_naive() {
+        ensure_today_current_data(app, &station_id).await?;
+    }
     ensure_derived(app, &station_id, target_date.year()).await?;
     let daily = load_all_daily(app, &station_id)?;
     let profiles = load_all_profiles(app, &station_id)?;
@@ -347,6 +354,9 @@ async fn query_probability(app: &App, args: ProbabilityArgs) -> Result<()> {
 async fn query_analogs(app: &App, args: AnalogsArgs) -> Result<()> {
     let target_date = target_date_or_today(args.date, args.today)?;
     let station_id = StationId::new(&args.station);
+    if target_date == Local::now().date_naive() {
+        ensure_today_current_data(app, &station_id).await?;
+    }
     ensure_derived(app, &station_id, target_date.year()).await?;
     let daily = load_all_daily(app, &station_id)?;
     let profiles = load_all_profiles(app, &station_id)?;
@@ -557,6 +567,30 @@ async fn ensure_derived(app: &App, station_id: &StationId, year: i32) -> Result<
     if !app.cache.day_profile_path(station_id, year).exists() {
         build_profiles(app, station_id, Some(year)).await?;
     }
+    Ok(())
+}
+
+async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<()> {
+    let today = Local::now().date_naive();
+    let normalized_path = app.cache.normalized_path(
+        DataSource::NwsApi,
+        station_id,
+        &format!("current-{}", today.format("%Y%m%d")),
+    );
+    if normalized_path.exists() {
+        return Ok(());
+    }
+
+    info!(station = %station_id, date = %today, "hydrating current-day observation for today query");
+    let station = app.sources.nws.fetch_station_metadata(station_id).await?;
+    let result = app.sources.nws.fetch_current(station_id, false).await?;
+    let normalized = app
+        .sources
+        .nws
+        .normalize_raw_file(Path::new(&result.path), &station)?;
+    write_json(&normalized_path, &normalized)?;
+    build_daily(app, station_id, Some(today.year())).await?;
+    build_profiles(app, station_id, Some(today.year())).await?;
     Ok(())
 }
 
