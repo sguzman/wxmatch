@@ -2,8 +2,12 @@ pub mod app;
 pub mod cache;
 pub mod cli;
 pub mod commands;
+pub mod domain;
+pub mod engine;
 pub mod logging;
 pub mod source;
+pub mod sources;
+pub mod storage;
 
 use anyhow::Result;
 use clap::Parser;

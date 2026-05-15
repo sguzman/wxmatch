@@ -7,6 +7,7 @@ use directories::BaseDirs;
 use serde::Serialize;
 use tracing::{debug, info, instrument};
 
+use crate::domain::StationId;
 use crate::source::{DataSource, all_sources};
 
 pub const APP_NAME: &str = "wxmatch";
@@ -82,6 +83,76 @@ impl CacheLayout {
 
     pub fn source_root(&self, source: DataSource) -> PathBuf {
         self.sources_dir.join(source.slug())
+    }
+
+    pub fn station_metadata_path(&self, station_id: &StationId) -> PathBuf {
+        self.stations_dir.join(format!("{station_id}.json"))
+    }
+
+    pub fn historical_raw_path(
+        &self,
+        source: DataSource,
+        station_id: &StationId,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+        extension: &str,
+    ) -> PathBuf {
+        self.source_root(source).join(format!(
+            "raw/station={station_id}/window={}__{}.{}",
+            start.format("%Y%m%d"),
+            end.format("%Y%m%d"),
+            extension
+        ))
+    }
+
+    pub fn current_raw_path(
+        &self,
+        source: DataSource,
+        station_id: &StationId,
+        date: chrono::NaiveDate,
+        extension: &str,
+    ) -> PathBuf {
+        self.source_root(source).join(format!(
+            "raw/station={station_id}/date={date}/latest.{extension}"
+        ))
+    }
+
+    pub fn normalized_path(
+        &self,
+        source: DataSource,
+        station_id: &StationId,
+        name: &str,
+    ) -> PathBuf {
+        self.source_root(source)
+            .join(format!("normalized/station={station_id}/{name}.json"))
+    }
+
+    pub fn daily_summary_path(&self, station_id: &StationId, year: i32) -> PathBuf {
+        self.derived_dir
+            .join(format!("station={station_id}/daily/year={year}.json"))
+    }
+
+    pub fn day_profile_path(&self, station_id: &StationId, year: i32) -> PathBuf {
+        self.derived_dir
+            .join(format!("station={station_id}/profiles/year={year}.json"))
+    }
+
+    pub fn fetch_manifest_path(
+        &self,
+        source: DataSource,
+        station_id: &StationId,
+        start: chrono::NaiveDate,
+        end: Option<chrono::NaiveDate>,
+    ) -> PathBuf {
+        let suffix = end.map_or_else(
+            || start.format("%Y%m%d").to_string(),
+            |end| format!("{}__{}", start.format("%Y%m%d"), end.format("%Y%m%d")),
+        );
+        self.manifests_dir.join(format!(
+            "fetch-{}-{}-{suffix}.json",
+            source.slug(),
+            station_id
+        ))
     }
 }
 
