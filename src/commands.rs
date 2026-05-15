@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -421,6 +422,7 @@ fn print_cache_layout(cache: &CacheLayout) {
 
 fn load_station_observations(app: &App, station_id: &StationId) -> Result<Vec<ObservationRecord>> {
     let mut observations = Vec::new();
+    let mut seen = HashSet::new();
     for source in [DataSource::IemAsosOneMinute, DataSource::NwsApi] {
         let root = app
             .cache
@@ -429,7 +431,16 @@ fn load_station_observations(app: &App, station_id: &StationId) -> Result<Vec<Ob
         for path in list_files_recursive(&root, "json")? {
             let mut file_observations = read_json::<Vec<ObservationRecord>>(&path)?;
             debug!(path = %path.display(), count = file_observations.len(), "loaded normalized observation file");
-            observations.append(&mut file_observations);
+            for observation in file_observations.drain(..) {
+                let key = (
+                    observation.source,
+                    observation.station_id.to_string(),
+                    observation.observed_at_utc,
+                );
+                if seen.insert(key) {
+                    observations.push(observation);
+                }
+            }
         }
     }
     observations.sort_by_key(|observation| observation.observed_at_utc);

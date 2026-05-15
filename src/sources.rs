@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
-use csv::ReaderBuilder;
+use csv::{ReaderBuilder, StringRecord};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument};
@@ -88,12 +88,23 @@ impl IemAsosOneMinuteAdapter {
         Self { cache, http }
     }
 
-    fn request_url(&self, station_id: &StationId, start: NaiveDate, end: NaiveDate) -> String {
+    fn request_url(
+        &self,
+        station_id: &StationId,
+        timezone: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> String {
         format!(
-            "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py?station={station}&vars=tmpf&vars=dwpf&vars=drct&vars=sknt&vars=pres1&sts={start}T00:00Z&ets={end}T23:59Z&what=download&tz=UTC",
+            "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py?station={station}&vars=tmpf&vars=dwpf&vars=drct&vars=sknt&vars=pres1&year1={year1}&month1={month1}&day1={day1}&hour1=0&minute1=0&year2={year2}&month2={month2}&day2={day2}&hour2=23&minute2=59&what=download&tz={timezone}",
             station = station_id.as_iem_id(),
-            start = start.format("%Y-%m-%d"),
-            end = end.format("%Y-%m-%d"),
+            year1 = start.format("%Y"),
+            month1 = start.format("%m"),
+            day1 = start.format("%d"),
+            year2 = end.format("%Y"),
+            month2 = end.format("%m"),
+            day2 = end.format("%d"),
+            timezone = timezone.replace('/', "%2F"),
         )
     }
 }
@@ -118,6 +129,7 @@ impl WeatherSourceAdapter for IemAsosOneMinuteAdapter {
         end: NaiveDate,
         refresh: bool,
     ) -> Result<HistoricalFetchResult> {
+        let station = self.fetch_station_metadata(station_id).await?;
         let path = self
             .cache
             .historical_raw_path(self.source(), station_id, start, end, "csv");
@@ -131,7 +143,7 @@ impl WeatherSourceAdapter for IemAsosOneMinuteAdapter {
             });
         }
 
-        let url = self.request_url(station_id, start, end);
+        let url = self.request_url(station_id, &station.timezone, start, end);
         info!(station = %station_id, %url, "downloading historical observations");
         let body = self
             .http
@@ -186,27 +198,29 @@ impl WeatherSourceAdapter for IemAsosOneMinuteAdapter {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut reader = ReaderBuilder::new().from_reader(content.as_bytes());
+        let headers = reader
+            .headers()
+            .context("failed to read IEM CSV headers")?
+            .clone();
+        let indexes = IemHeaderIndexes::from_headers(&headers)?;
         let mut observations = Vec::new();
 
-        for row in reader.deserialize::<IemObservationRow>() {
+        for row in reader.records() {
             let row = row.context("failed to parse IEM row")?;
-            let naive = chrono::NaiveDateTime::parse_from_str(&row.valid_utc, "%Y-%m-%d %H:%M")
-                .with_context(|| format!("failed to parse IEM timestamp {}", row.valid_utc))?;
-            let observed_utc = Utc.from_utc_datetime(&naive);
-            let observed_local = observed_utc.with_timezone(&timezone).fixed_offset();
+            let observed_local = indexes.parse_local_datetime(&row, timezone)?;
 
             let mut observation = ObservationRecord::from_parts(
                 station.station_id.clone(),
                 DataSource::IemAsosOneMinute,
-                row.station.clone(),
+                indexes.station(&row).to_owned(),
                 observed_local,
                 path.display().to_string(),
             );
-            observation.temperature_c = row.tmpf.map(fahrenheit_to_celsius);
-            observation.dewpoint_c = row.dwpf.map(fahrenheit_to_celsius);
-            observation.pressure_hpa = row.pres1.map(inches_hg_to_hpa);
-            observation.wind_direction_deg = row.drct;
-            observation.wind_speed_kt = row.sknt;
+            observation.temperature_c = indexes.tmpf(&row)?.map(fahrenheit_to_celsius);
+            observation.dewpoint_c = indexes.dwpf(&row)?.map(fahrenheit_to_celsius);
+            observation.pressure_hpa = indexes.pres1(&row)?.map(inches_hg_to_hpa);
+            observation.wind_direction_deg = indexes.drct(&row)?;
+            observation.wind_speed_kt = indexes.sknt(&row)?;
             observation.relative_humidity_pct =
                 match (observation.temperature_c, observation.dewpoint_c) {
                     (Some(temp_c), Some(dew_c)) => {
@@ -420,23 +434,6 @@ impl WeatherSourceAdapter for NwsApiAdapter {
 }
 
 #[derive(Debug, Deserialize)]
-struct IemObservationRow {
-    station: String,
-    #[serde(rename = "valid(UTC)")]
-    valid_utc: String,
-    #[serde(deserialize_with = "deserialize_optional_f64")]
-    tmpf: Option<f64>,
-    #[serde(deserialize_with = "deserialize_optional_f64")]
-    dwpf: Option<f64>,
-    #[serde(deserialize_with = "deserialize_optional_f64")]
-    drct: Option<f64>,
-    #[serde(deserialize_with = "deserialize_optional_f64")]
-    sknt: Option<f64>,
-    #[serde(deserialize_with = "deserialize_optional_f64")]
-    pres1: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct NwsStationResponse {
     geometry: NwsGeometry,
     properties: NwsStationProperties,
@@ -501,17 +498,87 @@ struct NwsQuantitativeValue {
     value: Option<f64>,
 }
 
-fn deserialize_optional_f64<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    match raw.as_deref().map(str::trim) {
+#[derive(Debug)]
+struct IemHeaderIndexes {
+    station: usize,
+    valid: usize,
+    tmpf: usize,
+    dwpf: usize,
+    drct: usize,
+    sknt: usize,
+    pres1: usize,
+}
+
+impl IemHeaderIndexes {
+    fn from_headers(headers: &StringRecord) -> Result<Self> {
+        Ok(Self {
+            station: find_header(headers, "station")?,
+            valid: headers
+                .iter()
+                .position(|value| value.starts_with("valid("))
+                .context("IEM CSV missing valid(...) column")?,
+            tmpf: find_header(headers, "tmpf")?,
+            dwpf: find_header(headers, "dwpf")?,
+            drct: find_header(headers, "drct")?,
+            sknt: find_header(headers, "sknt")?,
+            pres1: find_header(headers, "pres1")?,
+        })
+    }
+
+    fn station<'a>(&self, row: &'a StringRecord) -> &'a str {
+        row.get(self.station).unwrap_or_default()
+    }
+
+    fn parse_local_datetime(
+        &self,
+        row: &StringRecord,
+        timezone: Tz,
+    ) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+        let value = row.get(self.valid).unwrap_or_default();
+        let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M")
+            .with_context(|| format!("failed to parse IEM local timestamp {value}"))?;
+        timezone
+            .from_local_datetime(&naive)
+            .single()
+            .map(|datetime| datetime.fixed_offset())
+            .context("failed to resolve IEM local timestamp in station timezone")
+    }
+
+    fn tmpf(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(row.get(self.tmpf))
+    }
+
+    fn dwpf(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(row.get(self.dwpf))
+    }
+
+    fn drct(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(row.get(self.drct))
+    }
+
+    fn sknt(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(row.get(self.sknt))
+    }
+
+    fn pres1(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(row.get(self.pres1))
+    }
+}
+
+fn find_header(headers: &StringRecord, expected: &str) -> Result<usize> {
+    headers
+        .iter()
+        .position(|value| value == expected)
+        .with_context(|| format!("IEM CSV missing {expected} column"))
+}
+
+fn parse_optional_f64_field(raw: Option<&str>) -> Result<Option<f64>> {
+    match raw.map(str::trim) {
         None | Some("") | Some("M") | Some("VRB") => Ok(None),
         Some(value) => value
             .parse::<f64>()
             .map(Some)
-            .map_err(serde::de::Error::custom),
+            .with_context(|| format!("failed to parse numeric field {value}")),
     }
 }
 
@@ -519,18 +586,20 @@ where
 mod tests {
     use serde::Deserialize;
 
-    use super::deserialize_optional_f64;
+    use super::parse_optional_f64_field;
 
     #[derive(Deserialize)]
     struct Probe {
-        #[serde(deserialize_with = "deserialize_optional_f64")]
-        value: Option<f64>,
+        value: Option<String>,
     }
 
     #[test]
     fn parses_numeric_optional_f64() {
         let probe: Probe = serde_json::from_str(r#"{"value":"29.015"}"#).unwrap();
-        assert_eq!(probe.value, Some(29.015));
+        assert_eq!(
+            parse_optional_f64_field(probe.value.as_deref()).unwrap(),
+            Some(29.015)
+        );
     }
 
     #[test]
@@ -541,7 +610,10 @@ mod tests {
             r#"{"value":null}"#,
         ] {
             let probe: Probe = serde_json::from_str(raw).unwrap();
-            assert_eq!(probe.value, None);
+            assert_eq!(
+                parse_optional_f64_field(probe.value.as_deref()).unwrap(),
+                None
+            );
         }
     }
 }
