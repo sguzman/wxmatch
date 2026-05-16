@@ -192,8 +192,8 @@ bash scripts/acceptance_matrix.sh
 Inspect cached Parquet with DuckDB:
 
 ```bash
-duckdb -c "select local_date, high_temp_c from '.cache/wxmatch/derived/station=KLAX/daily/year=2026.parquet' limit 5"
-duckdb -c "select source, observed_at_utc, temperature_c from '.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KLAX/year=2026.parquet' limit 5"
+duckdb -c "select cast(local_date as date) as local_date, high_temp_c * 9.0/5.0 + 32.0 as high_f from read_parquet('.cache/wxmatch/derived/station=KLAX/daily/year=2026.parquet') limit 5"
+duckdb -c "select cast(observed_at_utc as timestamp) as observed_at_utc, temperature_c * 9.0/5.0 + 32.0 as temp_f from read_parquet('.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KLAX/year=2026.parquet') limit 5"
 cargo run -- query duckdb-paths --station KLAX --year 2026
 ```
 

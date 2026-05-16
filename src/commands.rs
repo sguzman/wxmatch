@@ -1582,21 +1582,29 @@ async fn query_duckdb_paths(
             "path": path.display().to_string(),
         }));
     }
-    let examples = normalized
-        .first()
-        .map(|entry| {
-            vec![
-                format!(
-                    "duckdb -c \"select * from '{}' limit 5\"",
-                    entry["path"].as_str().unwrap_or_default()
-                ),
-                format!(
-                    "duckdb -c \"describe select * from '{}'\"",
-                    entry["path"].as_str().unwrap_or_default()
-                ),
-            ]
-        })
-        .unwrap_or_default();
+    let mut examples = Vec::new();
+    if let Some(entry) = derived.iter().find(|entry| entry["kind"].as_str() == Some("daily")) {
+        let path = entry["path"].as_str().unwrap_or_default();
+        examples.push(format!(
+            "duckdb -c \"select cast(local_date as date) as local_date, high_temp_c * 9.0/5.0 + 32.0 as high_f from read_parquet('{}') limit 5\"",
+            path
+        ));
+        examples.push(format!(
+            "duckdb -c \\\"WITH may_days AS (SELECT cast(local_date as date) AS local_date, high_temp_c, low_temp_c FROM read_parquet('{}')) SELECT year(local_date) AS year, max(high_temp_c) * 9.0/5.0 + 32.0 AS may_max_high_f, min(low_temp_c) * 9.0/5.0 + 32.0 AS may_min_low_f, (max(high_temp_c) - min(low_temp_c)) * 9.0/5.0 AS may_range_f FROM may_days WHERE year(local_date) >= 2010 AND month(local_date) = 5 GROUP BY 1 ORDER BY 1\\\"",
+            path
+        ));
+    }
+    if let Some(entry) = normalized.first() {
+        let path = entry["path"].as_str().unwrap_or_default();
+        examples.push(format!(
+            "duckdb -c \"select cast(observed_at_utc as timestamp) as observed_at_utc, temperature_c * 9.0/5.0 + 32.0 as temp_f from read_parquet('{}') limit 5\"",
+            path
+        ));
+        examples.push(format!(
+            "duckdb -c \"describe select * from read_parquet('{}')\"",
+            path
+        ));
+    }
     let output = json!({
         "normalized": normalized,
         "derived": derived,
