@@ -311,13 +311,13 @@ async fn fetch_current(app: &App, args: FetchCurrentArgs) -> Result<()> {
     let normalized_path = app
         .cache
         .normalized_path(DataSource::NwsApi, &station_id, current_year);
-    merge_observations_into_year(&normalized_path, normalized)?;
+    let added = merge_observations_into_year(&normalized_path, normalized)?;
 
     println!("station: {}", station.station_id);
     println!("source: {}", DataSource::NwsApi.slug());
     println!("raw path: {}", result.path);
     println!("normalized path: {}", normalized_path.display());
-    println!("observations written: 1");
+    println!("observations added: {added}");
     Ok(())
 }
 
@@ -364,7 +364,7 @@ async fn normalize_station(app: &App, station_id: &StationId, source: DataSource
         let normalized_path = app.cache.normalized_path(source, station_id, year);
         let observations = grouped_by_year.remove(&year).unwrap_or_default();
         normalized_total += observations.len();
-        merge_observations_into_year(&normalized_path, observations)?;
+        let _added = merge_observations_into_year(&normalized_path, observations)?;
         info!(
             source = source.slug(),
             station = %station_id,
@@ -772,20 +772,34 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
     let normalized_path = app
         .cache
         .normalized_path(DataSource::NwsApi, station_id, today.year());
-    if normalized_path.exists() && read_observations_for_date(&normalized_path, today)?.len() > 0 {
-        return Ok(());
-    }
 
-    info!(station = %station_id, date = %today, "hydrating current-day observation for today query");
+    info!(station = %station_id, date = %today, "refreshing current-day observation for today query");
     let station = app.sources.nws.fetch_station_metadata(station_id).await?;
     let result = app.sources.nws.fetch_current(station_id, false).await?;
     let normalized = app
         .sources
         .nws
         .normalize_raw_file(Path::new(&result.path), &station)?;
-    merge_observations_into_year(&normalized_path, normalized)?;
-    build_daily(app, station_id, Some(today.year())).await?;
-    build_profiles(app, station_id, Some(today.year())).await?;
+    let added = merge_observations_into_year(&normalized_path, normalized)?;
+    let existing_today_count = if normalized_path.exists() {
+        read_observations_for_date(&normalized_path, today)?.len()
+    } else {
+        0
+    };
+    if added > 0
+        || !app.cache.daily_summary_path(station_id, today.year()).exists()
+        || !app.cache.day_profile_path(station_id, today.year()).exists()
+    {
+        info!(
+            station = %station_id,
+            date = %today,
+            added,
+            observations_for_day = existing_today_count,
+            "rebuilding derived datasets after current-day refresh"
+        );
+        build_daily(app, station_id, Some(today.year())).await?;
+        build_profiles(app, station_id, Some(today.year())).await?;
+    }
     Ok(())
 }
 
@@ -845,14 +859,17 @@ fn read_observation_records(path: &Path) -> Result<Vec<ObservationRecord>> {
         .collect::<Result<Vec<_>>>()
 }
 
-fn merge_observations_into_year(path: &Path, observations: Vec<ObservationRecord>) -> Result<()> {
+fn merge_observations_into_year(path: &Path, observations: Vec<ObservationRecord>) -> Result<usize> {
     let existing = if path.exists() {
         read_observation_records(path)?
     } else {
         Vec::new()
     };
+    let existing_count = existing.len();
     let merged = dedupe_observations(existing.into_iter().chain(observations).collect());
-    write_observation_records(path, &merged)
+    let merged_count = merged.len();
+    write_observation_records(path, &merged)?;
+    Ok(merged_count.saturating_sub(existing_count))
 }
 
 fn read_observations_for_date(
