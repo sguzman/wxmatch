@@ -16,8 +16,8 @@ use crate::cli::{
     StationCommand, StationSubcommand,
 };
 use crate::domain::{
-    DailySummary, DailySummaryRow, DayProfile, DayProfileRow, ObservationRecord, ObservationRow,
-    StationId, celsius_to_fahrenheit,
+    DailySummary, DailySummaryRow, DatasetManifest, DayProfile, DayProfileRow, ObservationRecord,
+    ObservationRow, SCHEMA_VERSION, StationId, celsius_to_fahrenheit,
 };
 use crate::engine::{
     DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder, build_probability_breakdown,
@@ -25,7 +25,7 @@ use crate::engine::{
 };
 use crate::source::{DataSource, SourceDescriptor, all_sources};
 use crate::sources::WeatherSourceAdapter;
-use crate::storage::{list_files_recursive, read_parquet, write_parquet};
+use crate::storage::{list_files_recursive, read_parquet, write_json, write_parquet};
 
 pub async fn dispatch(app: &App, cli: Cli) -> Result<()> {
     let format = cli.format;
@@ -64,36 +64,42 @@ async fn handle_cache(app: &App, command: CacheCommand) -> Result<()> {
 
 #[instrument(skip(app))]
 async fn handle_source(format: OutputFormat, app: &App, command: SourceCommand) -> Result<()> {
+    backfill_cached_manifests(app)?;
     match command.command {
         SourceSubcommand::List => {
             let descriptors = all_sources()
                 .into_iter()
                 .map(SourceDescriptor::from_source)
                 .map(|descriptor| {
-                    let normalized_root = app.cache.source_root(descriptor.source).join("normalized");
-                    let raw_root = app.cache.source_root(descriptor.source).join("raw");
-                    json!({
-                        "source": descriptor.source.slug(),
-                        "slug": descriptor.slug,
-                        "cadence": descriptor.cadence,
-                        "scope": descriptor.scope,
-                        "summary": descriptor.summary,
-                        "raw_files": count_files(&raw_root, source_raw_extension(descriptor.source)).unwrap_or(0),
-                        "normalized_parquet_files": count_files(&normalized_root, "parquet").unwrap_or(0),
-                    })
+                let normalized_root = app.cache.source_root(descriptor.source).join("normalized");
+                let raw_root = app.cache.source_root(descriptor.source).join("raw");
+                let manifest_root = app.cache.manifests_dir.as_path();
+                json!({
+                    "source": descriptor.source.slug(),
+                    "slug": descriptor.slug,
+                    "cadence": descriptor.cadence,
+                    "scope": descriptor.scope,
+                    "summary": descriptor.summary,
+                    "raw_files": count_files(&raw_root, source_raw_extension(descriptor.source)).unwrap_or(0),
+                    "normalized_parquet_files": count_files(&normalized_root, "parquet").unwrap_or(0),
+                    "normalized_manifests": count_matching_files(manifest_root, "json", &format!("normalized-{}-", descriptor.source.slug())).unwrap_or(0),
                 })
+            })
                 .collect::<Vec<_>>();
             if format == OutputFormat::Json {
                 print_json(&descriptors)?;
             } else {
                 for descriptor in descriptors {
                     println!(
-                        "{slug:16}  cadence={cadence:12} scope={scope:18} raw={raw_files:4} normalized={normalized_files:4} {summary}",
+                        "{slug:16}  cadence={cadence:12} scope={scope:18} raw={raw_files:4} normalized={normalized_files:4} manifests={manifest_files:4} {summary}",
                         slug = descriptor["slug"].as_str().unwrap_or_default(),
                         cadence = descriptor["cadence"].as_str().unwrap_or_default(),
                         scope = descriptor["scope"].as_str().unwrap_or_default(),
                         raw_files = descriptor["raw_files"].as_u64().unwrap_or_default(),
                         normalized_files = descriptor["normalized_parquet_files"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                        manifest_files = descriptor["normalized_manifests"]
                             .as_u64()
                             .unwrap_or_default(),
                         summary = descriptor["summary"].as_str().unwrap_or_default(),
@@ -108,6 +114,7 @@ async fn handle_source(format: OutputFormat, app: &App, command: SourceCommand) 
 
 #[instrument(skip(app))]
 async fn handle_station(format: OutputFormat, app: &App, command: StationCommand) -> Result<()> {
+    backfill_cached_manifests(app)?;
     match command.command {
         StationSubcommand::Inspect { station } => {
             let station_id = StationId::new(&station);
@@ -154,6 +161,16 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                     .join(format!("station={station_id}/profiles")),
                 "parquet",
             )?;
+            let normalized_manifests = count_manifest_files_for_station(
+                &app.cache.manifests_dir,
+                "normalized-",
+                &station_id,
+            )?;
+            let derived_manifests = count_manifest_files_for_station(
+                &app.cache.manifests_dir,
+                "derived-",
+                &station_id,
+            )?;
             let output = json!({
                 "station": station_record.station_id,
                 "source_station_id": station_record.source_station_id,
@@ -172,6 +189,8 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                     "ghcnh_normalized_files": normalized_ghcnh,
                     "daily_years_built": daily_years,
                     "profile_years_built": profile_years,
+                    "normalized_manifests": normalized_manifests,
+                    "derived_manifests": derived_manifests,
                 }
             });
             if format == OutputFormat::Json {
@@ -213,6 +232,8 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                 println!("ghcnh normalized files: {normalized_ghcnh}");
                 println!("daily years built: {daily_years}");
                 println!("profile years built: {profile_years}");
+                println!("normalized manifests: {normalized_manifests}");
+                println!("derived manifests: {derived_manifests}");
             }
         }
     }
@@ -365,6 +386,16 @@ async fn normalize_station(app: &App, station_id: &StationId, source: DataSource
         let observations = grouped_by_year.remove(&year).unwrap_or_default();
         normalized_total += observations.len();
         let _added = merge_observations_into_year(&normalized_path, observations)?;
+        let merged_observations = read_observation_records(&normalized_path)?;
+        write_normalized_manifest(
+            app,
+            source,
+            station_id,
+            year,
+            &normalized_path,
+            &merged_observations,
+            input_paths_for_year(source, station_id, year, app)?,
+        )?;
         info!(
             source = source.slug(),
             station = %station_id,
@@ -498,11 +529,14 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
                     .note
                     .as_ref()
                     .map(|note| format!(" [{note}]"))
-                .unwrap_or_default()
+                    .unwrap_or_default()
             );
         }
         for unavailable in &breakdown.unavailable_methods {
-            println!("{}: unavailable [{}]", unavailable.method, unavailable.reason);
+            println!(
+                "{}: unavailable [{}]",
+                unavailable.method, unavailable.reason
+            );
         }
         if let Some(combined) = breakdown.combined_probability {
             println!("combined: {:.1}%", combined * 100.0);
@@ -698,6 +732,16 @@ fn write_grouped_summaries(
         let path = app.cache.daily_summary_path(station_id, year);
         let values = grouped.get(&year).cloned().unwrap_or_default();
         write_daily_summaries(&path, &values)?;
+        write_derived_manifest(
+            app,
+            "daily",
+            station_id,
+            year,
+            &path,
+            values.len(),
+            values.iter().map(|row| row.local_date).min(),
+            values.iter().map(|row| row.local_date).max(),
+        )?;
         println!("daily summaries {} -> {}", year, path.display());
     }
     Ok(())
@@ -714,6 +758,7 @@ fn write_grouped_profiles(
         let path = app.cache.day_profile_path(station_id, year);
         let values = grouped.get(&year).cloned().unwrap_or_default();
         write_day_profiles(&path, &values)?;
+        write_profile_manifest(app, station_id, year, &path, &values)?;
         println!("day profiles {} -> {}", year, path.display());
     }
     Ok(())
@@ -734,6 +779,7 @@ fn collect_years<T>(grouped: &BTreeMap<i32, Vec<T>>, year: Option<i32>) -> Resul
 
 async fn ensure_derived(app: &App, station_id: &StationId, year: i32) -> Result<()> {
     ensure_normalized_station(app, station_id).await?;
+    backfill_derived_manifests(app, station_id, year)?;
     if !app.cache.daily_summary_path(station_id, year).exists() {
         build_daily(app, station_id, Some(year)).await?;
     }
@@ -750,6 +796,7 @@ async fn ensure_normalized_station(app: &App, station_id: &StationId) -> Result<
             .source_root(source)
             .join(format!("normalized/station={station_id}"));
         if count_files(&normalized_root, "parquet")? > 0 {
+            backfill_normalized_manifests(app, source, station_id)?;
             continue;
         }
 
@@ -787,8 +834,14 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
         0
     };
     if added > 0
-        || !app.cache.daily_summary_path(station_id, today.year()).exists()
-        || !app.cache.day_profile_path(station_id, today.year()).exists()
+        || !app
+            .cache
+            .daily_summary_path(station_id, today.year())
+            .exists()
+        || !app
+            .cache
+            .day_profile_path(station_id, today.year())
+            .exists()
     {
         info!(
             station = %station_id,
@@ -805,6 +858,34 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
 
 fn count_files(root: &Path, ext: &str) -> Result<usize> {
     Ok(list_files_recursive(root, ext)?.len())
+}
+
+fn count_matching_files(root: &Path, ext: &str, needle: &str) -> Result<usize> {
+    Ok(list_files_recursive(root, ext)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(needle))
+        })
+        .count())
+}
+
+fn count_manifest_files_for_station(
+    root: &Path,
+    prefix: &str,
+    station_id: &StationId,
+) -> Result<usize> {
+    Ok(list_files_recursive(root, "json")?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(prefix) && name.contains(&format!("-{station_id}-"))
+                })
+        })
+        .count())
 }
 
 fn resolve_target_profile(
@@ -859,7 +940,10 @@ fn read_observation_records(path: &Path) -> Result<Vec<ObservationRecord>> {
         .collect::<Result<Vec<_>>>()
 }
 
-fn merge_observations_into_year(path: &Path, observations: Vec<ObservationRecord>) -> Result<usize> {
+fn merge_observations_into_year(
+    path: &Path,
+    observations: Vec<ObservationRecord>,
+) -> Result<usize> {
     let existing = if path.exists() {
         read_observation_records(path)?
     } else {
@@ -908,4 +992,251 @@ fn write_day_profiles(path: &Path, profiles: &[DayProfile]) -> Result<()> {
 fn read_day_profiles(path: &Path) -> Result<Vec<DayProfile>> {
     let rows: Vec<DayProfileRow> = read_parquet(path)?;
     DayProfileRow::into_profiles(rows)
+}
+
+fn input_paths_for_year(
+    source: DataSource,
+    station_id: &StationId,
+    year: i32,
+    app: &App,
+) -> Result<Vec<String>> {
+    let root = app
+        .cache
+        .source_root(source)
+        .join(format!("raw/station={station_id}"));
+    let year_prefix = year.to_string();
+    Ok(list_files_recursive(&root, source_raw_extension(source))?
+        .into_iter()
+        .filter(|path| path.to_string_lossy().contains(&year_prefix))
+        .map(|path| path.display().to_string())
+        .collect())
+}
+
+fn backfill_normalized_manifests(
+    app: &App,
+    source: DataSource,
+    station_id: &StationId,
+) -> Result<()> {
+    let root = app
+        .cache
+        .source_root(source)
+        .join(format!("normalized/station={station_id}"));
+    for path in list_files_recursive(&root, "parquet")? {
+        let Some(year) = year_from_artifact_path(&path) else {
+            continue;
+        };
+        let manifest_path = app.cache.normalized_manifest_path(source, station_id, year);
+        if manifest_path.exists() {
+            continue;
+        }
+        let observations = read_observation_records(&path)?;
+        write_normalized_manifest(
+            app,
+            source,
+            station_id,
+            year,
+            &path,
+            &observations,
+            input_paths_for_year(source, station_id, year, app)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_cached_manifests(app: &App) -> Result<()> {
+    for source in all_sources() {
+        let normalized_root = app.cache.source_root(source).join("normalized");
+        for path in list_files_recursive(&normalized_root, "parquet")? {
+            let Some(station_id) = station_id_from_artifact_path(&path) else {
+                continue;
+            };
+            let Some(year) = year_from_artifact_path(&path) else {
+                continue;
+            };
+            let manifest_path = app
+                .cache
+                .normalized_manifest_path(source, &station_id, year);
+            if manifest_path.exists() {
+                continue;
+            }
+            let observations = read_observation_records(&path)?;
+            write_normalized_manifest(
+                app,
+                source,
+                &station_id,
+                year,
+                &path,
+                &observations,
+                input_paths_for_year(source, &station_id, year, app)?,
+            )?;
+        }
+    }
+
+    let derived_root = app.cache.derived_dir.clone();
+    for path in list_files_recursive(&derived_root, "parquet")? {
+        let Some(station_id) = station_id_from_artifact_path(&path) else {
+            continue;
+        };
+        let Some(year) = year_from_artifact_path(&path) else {
+            continue;
+        };
+        if path.to_string_lossy().contains("/daily/") {
+            let manifest_path = app.cache.derived_manifest_path("daily", &station_id, year);
+            if !manifest_path.exists() {
+                let values = read_daily_summaries(&path)?;
+                write_derived_manifest(
+                    app,
+                    "daily",
+                    &station_id,
+                    year,
+                    &path,
+                    values.len(),
+                    values.iter().map(|row| row.local_date).min(),
+                    values.iter().map(|row| row.local_date).max(),
+                )?;
+            }
+        } else if path.to_string_lossy().contains("/profiles/") {
+            let manifest_path = app
+                .cache
+                .derived_manifest_path("profiles", &station_id, year);
+            if !manifest_path.exists() {
+                let profiles = read_day_profiles(&path)?;
+                write_profile_manifest(app, &station_id, year, &path, &profiles)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn backfill_derived_manifests(app: &App, station_id: &StationId, year: i32) -> Result<()> {
+    let daily_path = app.cache.daily_summary_path(station_id, year);
+    let daily_manifest = app.cache.derived_manifest_path("daily", station_id, year);
+    if daily_path.exists() && !daily_manifest.exists() {
+        let values = read_daily_summaries(&daily_path)?;
+        write_derived_manifest(
+            app,
+            "daily",
+            station_id,
+            year,
+            &daily_path,
+            values.len(),
+            values.iter().map(|row| row.local_date).min(),
+            values.iter().map(|row| row.local_date).max(),
+        )?;
+    }
+
+    let profile_path = app.cache.day_profile_path(station_id, year);
+    let profile_manifest = app
+        .cache
+        .derived_manifest_path("profiles", station_id, year);
+    if profile_path.exists() && !profile_manifest.exists() {
+        let profiles = read_day_profiles(&profile_path)?;
+        write_profile_manifest(app, station_id, year, &profile_path, &profiles)?;
+    }
+    Ok(())
+}
+
+fn year_from_artifact_path(path: &Path) -> Option<i32> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_prefix("year="))
+        .and_then(|value| value.parse::<i32>().ok())
+}
+
+fn station_id_from_artifact_path(path: &Path) -> Option<StationId> {
+    path.ancestors()
+        .filter_map(|ancestor| ancestor.file_name().and_then(|value| value.to_str()))
+        .find_map(|value| value.strip_prefix("station=").map(StationId::new))
+}
+
+fn all_normalized_inputs_for_year(app: &App, station_id: &StationId, year: i32) -> Vec<String> {
+    all_sources()
+        .into_iter()
+        .map(|source| app.cache.normalized_path(source, station_id, year))
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+fn write_normalized_manifest(
+    app: &App,
+    source: DataSource,
+    station_id: &StationId,
+    year: i32,
+    artifact_path: &Path,
+    observations: &[ObservationRecord],
+    input_paths: Vec<String>,
+) -> Result<()> {
+    let start_date = observations.iter().map(|row| row.local_date).min();
+    let end_date = observations.iter().map(|row| row.local_date).max();
+    let manifest = DatasetManifest {
+        dataset_kind: "normalized-observations".to_owned(),
+        source: Some(source),
+        station_id: station_id.to_string(),
+        year,
+        schema_version: SCHEMA_VERSION.to_owned(),
+        generated_at_utc: chrono::Utc::now(),
+        row_count: observations.len(),
+        start_date,
+        end_date,
+        artifact_path: artifact_path.display().to_string(),
+        input_paths,
+    };
+    write_json(
+        &app.cache.normalized_manifest_path(source, station_id, year),
+        &manifest,
+    )
+}
+
+fn write_derived_manifest(
+    app: &App,
+    dataset_kind: &str,
+    station_id: &StationId,
+    year: i32,
+    artifact_path: &Path,
+    row_count: usize,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+) -> Result<()> {
+    let manifest = DatasetManifest {
+        dataset_kind: dataset_kind.to_owned(),
+        source: None,
+        station_id: station_id.to_string(),
+        year,
+        schema_version: SCHEMA_VERSION.to_owned(),
+        generated_at_utc: chrono::Utc::now(),
+        row_count,
+        start_date,
+        end_date,
+        artifact_path: artifact_path.display().to_string(),
+        input_paths: all_normalized_inputs_for_year(app, station_id, year),
+    };
+    write_json(
+        &app.cache
+            .derived_manifest_path(dataset_kind, station_id, year),
+        &manifest,
+    )
+}
+
+fn write_profile_manifest(
+    app: &App,
+    station_id: &StationId,
+    year: i32,
+    artifact_path: &Path,
+    profiles: &[DayProfile],
+) -> Result<()> {
+    let start_date = profiles.iter().map(|row| row.local_date).min();
+    let end_date = profiles.iter().map(|row| row.local_date).max();
+    let row_count = profiles.iter().map(|profile| profile.hours.len()).sum();
+    write_derived_manifest(
+        app,
+        "profiles",
+        station_id,
+        year,
+        artifact_path,
+        row_count,
+        start_date,
+        end_date,
+    )
 }

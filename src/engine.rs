@@ -297,7 +297,10 @@ impl ProbabilityMethod for TrajectoryMethod {
         let mut total_weight = 0.0;
         let mut sample_size = 0usize;
 
-        for profile in profiles.iter().filter(|profile| profile.local_date != target_date) {
+        for profile in profiles
+            .iter()
+            .filter(|profile| profile.local_date != target_date)
+        {
             let Some((candidate_temp, candidate_slope)) =
                 target_temperature_signature(profile, limit_hour)
             else {

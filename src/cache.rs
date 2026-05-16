@@ -156,6 +156,29 @@ impl CacheLayout {
             station_id
         ))
     }
+
+    pub fn normalized_manifest_path(
+        &self,
+        source: DataSource,
+        station_id: &StationId,
+        year: i32,
+    ) -> PathBuf {
+        self.manifests_dir.join(format!(
+            "normalized-{}-{}-{year}.json",
+            source.slug(),
+            station_id
+        ))
+    }
+
+    pub fn derived_manifest_path(
+        &self,
+        dataset_kind: &str,
+        station_id: &StationId,
+        year: i32,
+    ) -> PathBuf {
+        self.manifests_dir
+            .join(format!("derived-{dataset_kind}-{}-{year}.json", station_id))
+    }
 }
 
 #[instrument(skip(layout))]

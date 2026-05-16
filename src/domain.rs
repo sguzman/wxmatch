@@ -67,6 +67,21 @@ pub struct SourceMetadata {
     pub raw_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetManifest {
+    pub dataset_kind: String,
+    pub source: Option<DataSource>,
+    pub station_id: String,
+    pub year: i32,
+    pub schema_version: String,
+    pub generated_at_utc: DateTime<Utc>,
+    pub row_count: usize,
+    pub start_date: Option<NaiveDate>,
+    pub end_date: Option<NaiveDate>,
+    pub artifact_path: String,
+    pub input_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QualityFlag {
     MissingTemperature,
