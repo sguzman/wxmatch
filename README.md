@@ -183,6 +183,12 @@ Run formatting:
 cargo fmt
 ```
 
+Acceptance matrix:
+
+```bash
+bash scripts/acceptance_matrix.sh
+```
+
 Inspect cached Parquet with DuckDB:
 
 ```bash
@@ -204,6 +210,21 @@ cargo run -- query duckdb-paths --station KDSM --year 2026
 - Any analog or probability result that includes `GHCNh` fallback data is marked as mixed-cadence / lower-confidence in both text and JSON output.
 - Current-day queries automatically refresh the latest NWS observation, merge it into the yearly Parquet dataset, and report freshness or stale-data notes.
 - Sparse current-day queries now report explicit unavailability reasons when trajectory or analog methods do not yet have enough observed hours to run.
+
+## Validation Bar
+
+The current hardening bar is:
+
+- deterministic unit coverage for query-quality state, sparse-day behavior, manifest warnings, and weighted combination
+- acceptance flow on `KDSM` and `KDEN`
+- operator checks via `source list --format json`, `station inspect --format json`, and `cache doctor`
+- clean `cache doctor` after rebuilding derived datasets following any live `today` query
+
+The checked-in acceptance workflow is:
+
+```bash
+bash scripts/acceptance_matrix.sh
+```
 
 ## Project Plan
 
