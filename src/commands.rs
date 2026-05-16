@@ -14,13 +14,13 @@ use crate::app::App;
 use crate::cache::CacheLayout;
 use crate::cli::{
     AnalogsArgs, BuildCommand, BuildSubcommand, CacheCommand, CacheSubcommand, Cli, Command,
-    FetchCommand, FetchCurrentArgs, FetchStationArgs, NormalizeCommand, NormalizeSubcommand,
-    OutputFormat, ProbabilityArgs, QueryCommand, QuerySubcommand, SourceCommand, SourceSubcommand,
-    StationCommand, StationSubcommand,
+    FetchCommand, FetchCurrentArgs, FetchStationArgs, HypothesisArgs, NormalizeCommand,
+    NormalizeSubcommand, OutputFormat, ProbabilityArgs, QueryCommand, QuerySubcommand,
+    SourceCommand, SourceSubcommand, StationCommand, StationSubcommand,
 };
 use crate::domain::{
     DailySummary, DailySummaryRow, DatasetManifest, DayProfile, DayProfileRow, ObservationRecord,
-    ObservationRow, SCHEMA_VERSION, StationId, celsius_to_fahrenheit,
+    ObservationRow, SCHEMA_VERSION, StationId, celsius_to_fahrenheit, fahrenheit_to_celsius,
 };
 use crate::engine::{
     DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder, build_probability_breakdown,
@@ -49,6 +49,66 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(value).context("failed to serialize JSON output")?
     );
+    Ok(())
+}
+
+fn print_json_or_text(format: OutputFormat, output: &serde_json::Value) -> Result<()> {
+    if format == OutputFormat::Json {
+        return print_json(output);
+    }
+
+    println!(
+        "station: {}",
+        output["station"].as_str().unwrap_or_default()
+    );
+    println!("date: {}", output["date"].as_str().unwrap_or_default());
+    if let Some(as_of) = output["as_of"].as_str() {
+        println!("as-of: {as_of}");
+    }
+    if let Some(assume_temp_f) = output["assume_temp_f"].as_f64() {
+        println!("assumed temp: {assume_temp_f:.1}F");
+    }
+    if let Some(max_high_f) = output["max_high_f"].as_f64() {
+        println!("target max high: {max_high_f:.1}F");
+    }
+    println!(
+        "similar days: {}",
+        output["similar_days_count"].as_u64().unwrap_or_default()
+    );
+    println!(
+        "days with rounded target max: {}",
+        output["days_with_rounded_max_f"].as_u64().unwrap_or_default()
+    );
+    println!(
+        "days with high at or above target: {}",
+        output["days_with_high_at_or_above_f"]
+            .as_u64()
+            .unwrap_or_default()
+    );
+    if let Some(share) = output["rounded_max_share"].as_f64() {
+        println!("rounded target max share: {:.1}%", share * 100.0);
+    }
+    if let Some(share) = output["high_at_or_above_share"].as_f64() {
+        println!("high at/above target share: {:.1}%", share * 100.0);
+    }
+    if !output["target_observed_hours"].is_null() {
+        println!(
+            "target observed hours: {}",
+            output["target_observed_hours"].as_u64().unwrap_or_default()
+        );
+    }
+    if let Some(quality_state) = output["quality_state"].as_str() {
+        println!("quality state: {quality_state}");
+    }
+    if let Some(quality_note) = output["quality_note"].as_str() {
+        println!("quality: {quality_note}");
+    }
+    if let Some(freshness_note) = output["freshness_note"].as_str() {
+        println!("freshness: {freshness_note}");
+    }
+    if let Some(status_note) = output["status_note"].as_str() {
+        println!("status: {status_note}");
+    }
     Ok(())
 }
 
@@ -341,6 +401,7 @@ async fn handle_query(format: OutputFormat, app: &App, command: QueryCommand) ->
         }
         QuerySubcommand::Prob(args) => query_probability(format, app, args).await,
         QuerySubcommand::Analogs(args) => query_analogs(format, app, args).await,
+        QuerySubcommand::Hypothesis(args) => query_hypothesis(format, app, args).await,
         QuerySubcommand::DuckdbPaths { station, year } => {
             query_duckdb_paths(format, app, station.as_deref(), year).await
         }
@@ -785,6 +846,133 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
     Ok(())
 }
 
+#[instrument(skip(app))]
+async fn query_hypothesis(format: OutputFormat, app: &App, args: HypothesisArgs) -> Result<()> {
+    let target_date = target_date_or_today(args.date, args.today)?;
+    let station_id = StationId::new(&args.station);
+    if target_date == Local::now().date_naive() {
+        ensure_today_current_data(app, &station_id).await?;
+    }
+    ensure_derived(app, &station_id, target_date.year()).await?;
+    let daily = load_all_daily(app, &station_id)?;
+    let profiles = load_all_profiles(app, &station_id)?;
+    let as_of_hour = args.as_of.hour() as u8;
+    let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
+
+    let Some(target_profile) = target_profile else {
+        let output = json!({
+            "station": station_id.to_string(),
+            "date": target_date,
+            "as_of": args.as_of.format("%H:%M").to_string(),
+            "assume_temp_f": args.assume_temp,
+            "max_high_f": args.max_high,
+            "status_note": format!(
+                "no target profile is available for {}. fetch, normalize, and build data for that date first",
+                target_date
+            ),
+            "analogs": [],
+            "similar_days_count": 0,
+            "days_with_rounded_max_f": 0,
+            "days_with_high_at_or_above_f": 0,
+            "target_observed_hours": serde_json::Value::Null,
+            "freshness_note": freshness_note,
+            "quality_state": "normal",
+            "quality_note": serde_json::Value::Null,
+        });
+        return print_json_or_text(format, &output);
+    };
+
+    let synthetic_profile =
+        synthetic_temperature_profile(&target_profile, as_of_hour, f64::from(args.assume_temp));
+    let analogs = top_analogs(
+        &station_id,
+        target_date,
+        &daily,
+        &profiles,
+        &synthetic_profile,
+        Some(as_of_hour),
+        profiles.len(),
+    );
+    let rounded_target_max_f = args.max_high.round() as i32;
+    let days_with_rounded_max_f = analogs
+        .iter()
+        .filter_map(|analog| analog.observed_high_c.map(celsius_to_fahrenheit))
+        .filter(|high_f| high_f.round() as i32 == rounded_target_max_f)
+        .count();
+    let days_with_high_at_or_above_f = analogs
+        .iter()
+        .filter_map(|analog| analog.observed_high_c.map(celsius_to_fahrenheit))
+        .filter(|high_f| *high_f >= f64::from(args.max_high))
+        .count();
+    let days_with_usable_high = analogs
+        .iter()
+        .filter(|analog| analog.observed_high_c.is_some())
+        .count();
+    let top_analogs = analogs.iter().take(args.top).cloned().collect::<Vec<_>>();
+    let breakdown = build_probability_breakdown(
+        station_id.clone(),
+        target_date,
+        fahrenheit_to_celsius(f64::from(args.max_high)),
+        &daily,
+        &profiles,
+        Some(&synthetic_profile),
+        Some(as_of_hour),
+    );
+    let quality_state = probability_quality_state(
+        target_date,
+        Some(&synthetic_profile),
+        &daily,
+        &profiles,
+        Some(as_of_hour),
+    );
+    let quality_note = quality_note_for_day(
+        synthetic_profile.observed_hour_count,
+        &synthetic_profile.source_slugs,
+    );
+    let status_note = if analogs.is_empty() {
+        Some(format!(
+            "no comparable analogs found for synthetic {} {}F state at {}",
+            target_date,
+            args.assume_temp,
+            args.as_of.format("%H:%M")
+        ))
+    } else {
+        None
+    };
+
+    let output = json!({
+        "station": station_id.to_string(),
+        "date": target_date,
+        "as_of": args.as_of.format("%H:%M").to_string(),
+        "assume_temp_f": args.assume_temp,
+        "max_high_f": args.max_high,
+        "exact_max_definition": format!("rounded final daily high equals {}F", rounded_target_max_f),
+        "similar_days_count": analogs.len(),
+        "days_with_usable_high": days_with_usable_high,
+        "days_with_rounded_max_f": days_with_rounded_max_f,
+        "days_with_high_at_or_above_f": days_with_high_at_or_above_f,
+        "rounded_max_share": if days_with_usable_high > 0 {
+            Some(days_with_rounded_max_f as f64 / days_with_usable_high as f64)
+        } else {
+            None::<f64>
+        },
+        "high_at_or_above_share": if days_with_usable_high > 0 {
+            Some(days_with_high_at_or_above_f as f64 / days_with_usable_high as f64)
+        } else {
+            None::<f64>
+        },
+        "target_observed_hours": synthetic_profile.observed_hour_count,
+        "quality_state": quality_state,
+        "quality_note": quality_note,
+        "freshness_note": freshness_note,
+        "status_note": status_note,
+        "probability_breakdown": breakdown,
+        "top_analogs": top_analogs,
+    });
+    print_json_or_text(format, &output)
+}
+
 fn run_cache_doctor(cache: &CacheLayout) -> Result<()> {
     println!("cache root: {}", cache.root.display());
     for dir in cache.directories() {
@@ -1183,6 +1371,27 @@ fn resolve_target_profile(
     }
 
     Ok(None)
+}
+
+fn synthetic_temperature_profile(
+    profile: &DayProfile,
+    as_of_hour: u8,
+    assume_temp_f: f64,
+) -> DayProfile {
+    let mut synthetic = profile.clone();
+    let assume_temp_c = fahrenheit_to_celsius(assume_temp_f);
+    if let Some(hour) = synthetic.hours.iter_mut().find(|hour| hour.hour == as_of_hour) {
+        hour.temperature_c = Some(assume_temp_c);
+        if hour.sample_count == 0 {
+            hour.sample_count = 1;
+        }
+    }
+    synthetic.observed_hour_count = synthetic
+        .hours
+        .iter()
+        .filter(|hour| hour.sample_count > 0)
+        .count();
+    synthetic
 }
 
 fn source_raw_extension(source: DataSource) -> &'static str {

@@ -187,6 +187,7 @@ pub enum QuerySubcommand {
     },
     Prob(ProbabilityArgs),
     Analogs(AnalogsArgs),
+    Hypothesis(HypothesisArgs),
     DuckdbPaths {
         #[arg(long)]
         station: Option<String>,
@@ -224,6 +225,29 @@ pub struct AnalogsArgs {
 
     #[arg(long)]
     pub as_of: Option<NaiveTime>,
+
+    #[arg(long, default_value_t = 25)]
+    pub top: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct HypothesisArgs {
+    pub station: String,
+
+    #[arg(long, conflicts_with = "today")]
+    pub date: Option<NaiveDate>,
+
+    #[arg(long, default_value_t = false)]
+    pub today: bool,
+
+    #[arg(long)]
+    pub as_of: NaiveTime,
+
+    #[arg(long)]
+    pub assume_temp: f32,
+
+    #[arg(long)]
+    pub max_high: f32,
 
     #[arg(long, default_value_t = 25)]
     pub top: usize,
@@ -290,6 +314,35 @@ mod tests {
                 QuerySubcommand::DuckdbPaths { station, year } => {
                     assert_eq!(station.as_deref(), Some("KDSM"));
                     assert_eq!(year, Some(2026));
+                }
+                other => panic!("unexpected subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_query_hypothesis_subcommand() {
+        let cli = Cli::parse_from([
+            "wxmatch",
+            "query",
+            "hypothesis",
+            "KLAX",
+            "--date",
+            "2026-05-15",
+            "--as-of",
+            "12:00",
+            "--assume-temp",
+            "66",
+            "--max-high",
+            "68",
+        ]);
+        match cli.command {
+            Command::Query(query) => match query.command {
+                QuerySubcommand::Hypothesis(args) => {
+                    assert_eq!(args.station, "KLAX");
+                    assert_eq!(args.assume_temp, 66.0);
+                    assert_eq!(args.max_high, 68.0);
                 }
                 other => panic!("unexpected subcommand: {other:?}"),
             },
