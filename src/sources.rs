@@ -1008,7 +1008,7 @@ impl GhcnhHeaderIndexes {
         path: &Path,
     ) -> Result<Option<ObservationRecord>> {
         let observed_utc = row.get(self.date).unwrap_or_default();
-        if observed_utc.is_empty() {
+        if observed_utc.is_empty() || observed_utc == "DATE" {
             return Ok(None);
         }
         let observed_utc = if let Ok(value) = DateTime::parse_from_rfc3339(observed_utc) {
