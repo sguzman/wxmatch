@@ -28,14 +28,16 @@ The project is aimed at a workflow like:
 - `query day`
 - `query prob`
 - `query analogs`
-- `--format text|json` for `source list`, `station inspect`, and query commands
+- `cache manifests`
+- `query duckdb-paths`
+- `cache doctor` warnings for missing or stale manifests
+- `--format text|json` for `source list`, `station inspect`, manifest inspection, and query commands
 
 ### Planned next
 
-- Richer cloud/precipitation coverage in historical ingestion
-- Additional probability methods and more formal score blending
-- More calibration and validation around mixed-cadence analog weighting
-- Optional helper commands around DuckDB inspection and migration ergonomics
+- Additional calibration and validation against larger backfilled station histories
+- More provenance detail for overlapping-source reconciliation
+- Broader source and station coverage testing outside the current smoke set
 
 ## Why These Sources
 
@@ -110,6 +112,8 @@ cargo run -- source list
 cargo run -- source list --format json
 cargo run -- station inspect KDSM
 cargo run -- station inspect KDSM --format json
+cargo run -- cache manifests --station KDSM
+cargo run -- cache manifests --station KDSM --format json
 cargo run -- fetch station KDSM --source iem-asos-one-minute --start 2026-05-14 --end 2026-05-14
 cargo run -- fetch station KDSM --source ncei-asos-five-minute --start 2026-05-14 --end 2026-05-14
 cargo run -- fetch station KDSM --source ghcnh --start 2026-05-14 --end 2026-05-14
@@ -120,9 +124,31 @@ cargo run -- build profiles KDSM --year 2026
 cargo run -- query day KDSM 2026-05-14
 cargo run -- query day KDSM 2026-05-14 --format json
 cargo run -- query prob KDSM --date 2026-05-14 --threshold-high 75
+cargo run -- query prob KDSM --today --threshold-high 80 --format json
 cargo run -- fetch current KDSM
 cargo run -- query analogs KDSM --date 2026-05-14 --top 10
+cargo run -- query duckdb-paths --station KDSM --year 2026
 ```
+
+## Probability Output
+
+`query prob` reports each available method separately and only emits a combined probability when at least two methods are available.
+
+Implemented methods:
+
+- `seasonal-climatology`
+- `temperature-trajectory`
+- `partial-profile-analogs`
+- `nearest-neighbor-analogs`
+
+Current fixed weights:
+
+- climatology: `0.25`
+- trajectory: `0.20`
+- partial-profile analogs: `0.30`
+- nearest-neighbor analogs: `0.25`
+
+The combined result renormalizes across only the methods that are actually available for the target day. Output also includes unavailable methods, cadence warnings, and current-day freshness notes when applicable.
 
 ## Logging
 
@@ -161,16 +187,20 @@ Inspect cached Parquet with DuckDB:
 ```bash
 duckdb -c "select local_date, high_temp_c from '~/.cache/wxmatch/derived/station=KDSM/daily/year=2026.parquet' limit 5"
 duckdb -c "select source, observed_at_utc, temperature_c from '~/.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KDSM/year=2026.parquet' limit 5"
+cargo run -- query duckdb-paths --station KDSM --year 2026
 ```
 
 ## Notes on v1 Behavior
 
 - The IEM path still targets the fields reliably exposed by the 1-minute endpoint: temperature, dew point, wind direction, wind speed, and pressure.
-- The NCEI 5-minute adapter parses METAR-style tokens from the NOAA archive and currently emphasizes temperature, dew point, wind, visibility, cloud code, and altimeter-derived pressure.
+- The IEM adapter now also captures stable precipitation, visibility, and primary cloud-code fields when the export exposes them.
+- The NCEI 5-minute adapter parses METAR-style tokens from the NOAA archive and currently emphasizes temperature, dew point, wind, gust, visibility, precip tokens, cloud layers, and altimeter-derived pressure.
 - The GHCNh adapter normalizes the stable hourly fields exposed by the PSV export and acts as a lower-resolution fallback.
 - Relative humidity is derived during normalization when temperature and dew point are present.
 - Current NWS observations add cloud cover, visibility, pressure, and gust fields when available, and repeated fetches keep multiple same-day raw snapshots.
-- Analog matching is same-station only in the current implementation and uses hourly profiles built from normalized observations.
+- Analog matching is same-station only and prefers same-cadence candidates before mixed-cadence fallback days.
+- Any analog or probability result that includes `GHCNh` fallback data is marked as mixed-cadence / lower-confidence in both text and JSON output.
+- Current-day queries automatically refresh the latest NWS observation, merge it into the yearly Parquet dataset, and report freshness or stale-data notes.
 
 ## Project Plan
 

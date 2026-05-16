@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use arrow::datatypes::FieldRef;
@@ -19,13 +20,13 @@ pub fn ensure_parent(path: &Path) -> Result<()> {
 
 pub fn write_text(path: &Path, body: &str) -> Result<()> {
     ensure_parent(path)?;
-    fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))
+    atomic_write_bytes(path, body.as_bytes())
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     ensure_parent(path)?;
     let body = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
-    fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))
+    atomic_write_bytes(path, &body)
 }
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -42,16 +43,18 @@ where
         .context("failed to derive Arrow schema from type")?;
     let batch = serde_arrow::to_record_batch(&fields, &rows)
         .context("failed to build Arrow record batch")?;
-    let file = fs::File::create(path)
-        .with_context(|| format!("failed to create parquet file {}", path.display()))?;
+    let temp_path = atomic_temp_path(path);
+    let file = fs::File::create(&temp_path)
+        .with_context(|| format!("failed to create parquet file {}", temp_path.display()))?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
         .context("failed to create parquet writer")?;
     writer
         .write(&batch)
-        .with_context(|| format!("failed to write parquet batch {}", path.display()))?;
+        .with_context(|| format!("failed to write parquet batch {}", temp_path.display()))?;
     writer
         .close()
-        .with_context(|| format!("failed to finalize parquet file {}", path.display()))?;
+        .with_context(|| format!("failed to finalize parquet file {}", temp_path.display()))?;
+    atomic_rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -94,6 +97,35 @@ pub fn list_files_recursive(root: &Path, ext: &str) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_path = atomic_temp_path(path);
+    fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    atomic_rename(&temp_path, path)
+}
+
+fn atomic_temp_path(path: &Path) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    path.with_file_name(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()))
+}
+
+fn atomic_rename(temp_path: &Path, target_path: &Path) -> Result<()> {
+    fs::rename(temp_path, target_path).with_context(|| {
+        format!(
+            "failed to move temporary file {} into place at {}",
+            temp_path.display(),
+            target_path.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -146,6 +178,7 @@ mod tests {
             station_id: "KDSM".to_owned(),
             local_date: "2026-05-14".to_owned(),
             observation_count: 24,
+            source_slugs_json: "[\"iem-asos-1min\"]".to_owned(),
             high_temp_c: Some(30.0),
             low_temp_c: Some(20.0),
             mean_temp_c: Some(25.0),
@@ -162,6 +195,7 @@ mod tests {
             station_id: "KDSM".to_owned(),
             local_date: "2026-05-14".to_owned(),
             observed_hour_count: 24,
+            source_slugs_json: "[\"iem-asos-1min\"]".to_owned(),
             hour: 0,
             sample_count: 1,
             temperature_c: Some(21.0),

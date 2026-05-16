@@ -102,7 +102,7 @@ impl IemAsosOneMinuteAdapter {
         end: NaiveDate,
     ) -> String {
         format!(
-            "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py?station={station}&vars=tmpf&vars=dwpf&vars=drct&vars=sknt&vars=pres1&year1={year1}&month1={month1}&day1={day1}&hour1=0&minute1=0&year2={year2}&month2={month2}&day2={day2}&hour2=23&minute2=59&what=download&tz={timezone}",
+            "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py?station={station}&vars=tmpf&vars=dwpf&vars=drct&vars=sknt&vars=pres1&vars=p01i&vars=vsby&vars=skyc1&year1={year1}&month1={month1}&day1={day1}&hour1=0&minute1=0&year2={year2}&month2={month2}&day2={day2}&hour2=23&minute2=59&what=download&tz={timezone}",
             station = station_id.as_iem_id(),
             year1 = start.format("%Y"),
             month1 = start.format("%m"),
@@ -227,6 +227,13 @@ impl WeatherSourceAdapter for IemAsosOneMinuteAdapter {
             observation.pressure_hpa = indexes.pres1(&row)?.map(inches_hg_to_hpa);
             observation.wind_direction_deg = indexes.drct(&row)?;
             observation.wind_speed_kt = indexes.sknt(&row)?;
+            observation.precipitation_mm = indexes.p01i(&row)?.map(|value| value * 25.4);
+            observation.visibility_km = indexes.vsby(&row)?.map(|value| value * 1.60934);
+            observation.cloud_cover_code = indexes.skyc1(&row)?;
+            observation.cloud_cover_fraction = observation
+                .cloud_cover_code
+                .as_deref()
+                .and_then(cloud_fraction_from_code);
             observation.relative_humidity_pct =
                 match (observation.temperature_c, observation.dewpoint_c) {
                     (Some(temp_c), Some(dew_c)) => {
@@ -256,6 +263,21 @@ impl WeatherSourceAdapter for IemAsosOneMinuteAdapter {
             }
             if observation.pressure_hpa.is_none() {
                 observation.quality_flags.push(QualityFlag::MissingPressure);
+            }
+            if indexes.skyc1.is_none() {
+                observation
+                    .quality_flags
+                    .push(QualityFlag::SourceFieldMissing("skyc1".to_owned()));
+            }
+            if indexes.p01i.is_none() {
+                observation
+                    .quality_flags
+                    .push(QualityFlag::SourceFieldMissing("p01i".to_owned()));
+            }
+            if indexes.vsby.is_none() {
+                observation
+                    .quality_flags
+                    .push(QualityFlag::SourceFieldMissing("vsby".to_owned()));
             }
 
             observations.push(observation);
@@ -807,6 +829,9 @@ struct IemHeaderIndexes {
     drct: usize,
     sknt: usize,
     pres1: usize,
+    p01i: Option<usize>,
+    vsby: Option<usize>,
+    skyc1: Option<usize>,
 }
 
 impl IemHeaderIndexes {
@@ -822,6 +847,9 @@ impl IemHeaderIndexes {
             drct: find_header(headers, "drct")?,
             sknt: find_header(headers, "sknt")?,
             pres1: find_header(headers, "pres1")?,
+            p01i: find_optional_header(headers, "p01i"),
+            vsby: find_optional_header(headers, "vsby"),
+            skyc1: find_optional_header(headers, "skyc1"),
         })
     }
 
@@ -863,6 +891,23 @@ impl IemHeaderIndexes {
     fn pres1(&self, row: &StringRecord) -> Result<Option<f64>> {
         parse_optional_f64_field(row.get(self.pres1))
     }
+
+    fn p01i(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(self.p01i.and_then(|index| row.get(index)))
+    }
+
+    fn vsby(&self, row: &StringRecord) -> Result<Option<f64>> {
+        parse_optional_f64_field(self.vsby.and_then(|index| row.get(index)))
+    }
+
+    fn skyc1(&self, row: &StringRecord) -> Result<Option<String>> {
+        Ok(self
+            .skyc1
+            .and_then(|index| row.get(index))
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "M")
+            .map(ToOwned::to_owned))
+    }
 }
 
 fn find_header(headers: &StringRecord, expected: &str) -> Result<usize> {
@@ -870,6 +915,10 @@ fn find_header(headers: &StringRecord, expected: &str) -> Result<usize> {
         .iter()
         .position(|value| value == expected)
         .with_context(|| format!("IEM CSV missing {expected} column"))
+}
+
+fn find_optional_header(headers: &StringRecord, expected: &str) -> Option<usize> {
+    headers.iter().position(|value| value == expected)
 }
 
 fn parse_optional_f64_field(raw: Option<&str>) -> Result<Option<f64>> {
@@ -968,6 +1017,11 @@ impl GhcnhHeaderIndexes {
         observation.visibility_km = parse_optional_f64_field(row.get(self.visibility))?;
         if observation.pressure_hpa.is_none() {
             observation.pressure_hpa = parse_optional_f64_field(row.get(self.altimeter))?;
+            if observation.pressure_hpa.is_none() {
+                observation
+                    .quality_flags
+                    .push(QualityFlag::SourceFieldMissing("altimeter".to_owned()));
+            }
         }
         observation.cloud_cover_code = row
             .get(self.sky_cover_layer_1)
@@ -993,6 +1047,12 @@ impl GhcnhHeaderIndexes {
                 observation
                     .quality_flags
                     .push(QualityFlag::DerivedRelativeHumidity);
+            } else {
+                observation
+                    .quality_flags
+                    .push(QualityFlag::SourceFieldMissing(
+                        "relative_humidity".to_owned(),
+                    ));
             }
         }
         Ok(Some(observation))
@@ -1061,6 +1121,10 @@ fn parse_ncei_line(
             observation.wind_gust_kt = gust;
             continue;
         }
+        if token.starts_with('P') && token.len() == 5 {
+            observation.precipitation_mm = parse_ncei_precip_token(token);
+            continue;
+        }
         if token.ends_with("SM") {
             observation.visibility_km = parse_visibility_token(token);
             continue;
@@ -1090,6 +1154,15 @@ fn parse_ncei_line(
                 observation.cloud_cover_code = Some(code.to_owned());
                 observation.cloud_cover_fraction = cloud_fraction_from_code(code);
             }
+        } else if let Some(code) = token.get(0..3) {
+            if let Some(fraction) = cloud_fraction_from_code(code) {
+                observation.cloud_cover_fraction = Some(
+                    observation
+                        .cloud_cover_fraction
+                        .map(|current| current.max(fraction))
+                        .unwrap_or(fraction),
+                );
+            }
         }
     }
 
@@ -1107,6 +1180,16 @@ fn parse_ncei_line(
         let (u, v) = wind_components_knots(direction, speed);
         observation.wind_u_kt = Some(u);
         observation.wind_v_kt = Some(v);
+    }
+    if observation.precipitation_mm.is_none() {
+        observation
+            .quality_flags
+            .push(QualityFlag::SourceFieldMissing("precip-token".to_owned()));
+    }
+    if observation.cloud_cover_code.is_none() {
+        observation
+            .quality_flags
+            .push(QualityFlag::SourceFieldMissing("cloud-layer".to_owned()));
     }
     Ok(Some(observation))
 }
@@ -1154,6 +1237,11 @@ fn parse_miles_number(token: &str) -> Option<f64> {
 fn parse_altimeter_token(token: &str) -> Option<f64> {
     let value = token.strip_prefix('A')?.parse::<f64>().ok()?;
     Some(inches_hg_to_hpa(value / 100.0))
+}
+
+fn parse_ncei_precip_token(token: &str) -> Option<f64> {
+    let hundredths = token.strip_prefix('P')?.parse::<f64>().ok()?;
+    Some(hundredths * 0.254)
 }
 
 fn parse_temp_dew_token(token: &str) -> Result<(Option<f64>, Option<f64>)> {

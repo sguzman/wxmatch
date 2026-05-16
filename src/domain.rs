@@ -80,6 +80,8 @@ pub struct DatasetManifest {
     pub end_date: Option<NaiveDate>,
     pub artifact_path: String,
     pub input_paths: Vec<String>,
+    pub warnings: Vec<String>,
+    pub source_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +128,7 @@ pub struct DailySummary {
     pub station_id: StationId,
     pub local_date: NaiveDate,
     pub observation_count: usize,
+    pub source_slugs: Vec<String>,
     pub high_temp_c: Option<f64>,
     pub low_temp_c: Option<f64>,
     pub mean_temp_c: Option<f64>,
@@ -156,6 +159,7 @@ pub struct DayProfile {
     pub station_id: StationId,
     pub local_date: NaiveDate,
     pub observed_hour_count: usize,
+    pub source_slugs: Vec<String>,
     pub hours: Vec<HourlyProfilePoint>,
 }
 
@@ -164,6 +168,8 @@ pub struct ProbabilityEstimate {
     pub method: String,
     pub probability: f64,
     pub sample_size: usize,
+    pub weight_used: Option<f64>,
+    pub confidence_note: Option<String>,
     pub note: Option<String>,
 }
 
@@ -180,7 +186,15 @@ pub struct ProbabilityBreakdown {
     pub threshold_high_c: f64,
     pub methods: Vec<ProbabilityEstimate>,
     pub unavailable_methods: Vec<MethodAvailability>,
+    pub combined: Option<CombinedProbability>,
     pub combined_probability: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombinedProbability {
+    pub probability: f64,
+    pub method_count: usize,
+    pub combination_note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +205,8 @@ pub struct AnalogResult {
     pub distance: f64,
     pub observed_high_c: Option<f64>,
     pub compared_hours: usize,
+    pub candidate_source_summary: String,
+    pub source_mix_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +244,7 @@ pub struct DailySummaryRow {
     pub station_id: String,
     pub local_date: String,
     pub observation_count: u64,
+    pub source_slugs_json: String,
     pub high_temp_c: Option<f64>,
     pub low_temp_c: Option<f64>,
     pub mean_temp_c: Option<f64>,
@@ -246,6 +263,7 @@ pub struct DayProfileRow {
     pub station_id: String,
     pub local_date: String,
     pub observed_hour_count: u64,
+    pub source_slugs_json: String,
     pub hour: u8,
     pub sample_count: u64,
     pub temperature_c: Option<f64>,
@@ -373,6 +391,8 @@ impl DailySummaryRow {
             station_id: value.station_id.to_string(),
             local_date: value.local_date.format("%Y-%m-%d").to_string(),
             observation_count: value.observation_count as u64,
+            source_slugs_json: serde_json::to_string(&value.source_slugs)
+                .unwrap_or_else(|_| "[]".to_owned()),
             high_temp_c: value.high_temp_c,
             low_temp_c: value.low_temp_c,
             mean_temp_c: value.mean_temp_c,
@@ -392,6 +412,8 @@ impl DailySummaryRow {
             local_date: NaiveDate::parse_from_str(&self.local_date, "%Y-%m-%d")
                 .context("failed to parse summary local_date")?,
             observation_count: self.observation_count as usize,
+            source_slugs: serde_json::from_str(&self.source_slugs_json)
+                .context("failed to parse summary source slugs")?,
             high_temp_c: self.high_temp_c,
             low_temp_c: self.low_temp_c,
             mean_temp_c: self.mean_temp_c,
@@ -416,6 +438,8 @@ impl DayProfileRow {
                 station_id: value.station_id.to_string(),
                 local_date: value.local_date.format("%Y-%m-%d").to_string(),
                 observed_hour_count: value.observed_hour_count as u64,
+                source_slugs_json: serde_json::to_string(&value.source_slugs)
+                    .unwrap_or_else(|_| "[]".to_owned()),
                 hour: hour.hour,
                 sample_count: hour.sample_count as u64,
                 temperature_c: hour.temperature_c,
@@ -442,6 +466,12 @@ impl DayProfileRow {
         for ((station_id, local_date), mut rows) in grouped {
             rows.sort_by_key(|row| row.hour);
             let observed_hour_count = rows.first().map(|row| row.observed_hour_count).unwrap_or(0);
+            let source_slugs = rows
+                .first()
+                .map(|row| serde_json::from_str(&row.source_slugs_json))
+                .transpose()
+                .context("failed to parse profile source slugs")?
+                .unwrap_or_default();
             let hours = rows
                 .into_iter()
                 .map(|row| HourlyProfilePoint {
@@ -461,6 +491,7 @@ impl DayProfileRow {
                 local_date: NaiveDate::parse_from_str(&local_date, "%Y-%m-%d")
                     .context("failed to parse profile local_date")?,
                 observed_hour_count: observed_hour_count as usize,
+                source_slugs,
                 hours,
             });
         }

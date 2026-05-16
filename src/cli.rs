@@ -70,6 +70,10 @@ pub enum CacheSubcommand {
     Init,
     Show,
     Doctor,
+    Manifests {
+        #[arg(long)]
+        station: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -174,10 +178,21 @@ pub struct QueryCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum QuerySubcommand {
-    Day { station: String, date: NaiveDate },
-    Today { station: String },
+    Day {
+        station: String,
+        date: NaiveDate,
+    },
+    Today {
+        station: String,
+    },
     Prob(ProbabilityArgs),
     Analogs(AnalogsArgs),
+    DuckdbPaths {
+        #[arg(long)]
+        station: Option<String>,
+        #[arg(long)]
+        year: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -218,7 +233,7 @@ pub struct AnalogsArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, QuerySubcommand};
+    use super::{CacheSubcommand, Cli, Command, QuerySubcommand};
 
     #[test]
     fn parses_probability_query() {
@@ -238,6 +253,43 @@ mod tests {
                     assert_eq!(args.station, "KDEN");
                     assert!(args.today);
                     assert_eq!(args.threshold_high, 77.5);
+                }
+                other => panic!("unexpected subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_cache_manifests_subcommand() {
+        let cli = Cli::parse_from(["wxmatch", "cache", "manifests", "--station", "KDSM"]);
+        match cli.command {
+            Command::Cache(command) => match command.command {
+                CacheSubcommand::Manifests { station } => {
+                    assert_eq!(station.as_deref(), Some("KDSM"));
+                }
+                other => panic!("unexpected subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_query_duckdb_paths_subcommand() {
+        let cli = Cli::parse_from([
+            "wxmatch",
+            "query",
+            "duckdb-paths",
+            "--station",
+            "KDSM",
+            "--year",
+            "2026",
+        ]);
+        match cli.command {
+            Command::Query(query) => match query.command {
+                QuerySubcommand::DuckdbPaths { station, year } => {
+                    assert_eq!(station.as_deref(), Some("KDSM"));
+                    assert_eq!(year, Some(2026));
                 }
                 other => panic!("unexpected subcommand: {other:?}"),
             },

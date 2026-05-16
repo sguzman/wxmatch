@@ -17,6 +17,7 @@ This document is the working implementation spec for the current repository stat
 - Normalized observations are written as Parquet datasets keyed by station and year.
 - Daily summaries and hourly day profiles are written as Parquet datasets keyed by station and year.
 - Query commands support text and JSON output.
+- Dataset manifests cover normalized and derived Parquet artifacts.
 
 ## Canonical Data Model
 
@@ -102,7 +103,7 @@ Rules:
 - raw files are immutable and source-specific
 - normalized Parquet files are rebuildable from raw
 - derived Parquet files are rebuildable from normalized data
-- manifests remain JSON and record source, schema version, generation time, and raw path
+- manifests remain JSON and record source, schema version, generation time, row counts, coverage, warnings, and artifact/input paths
 - rebuild-from-raw is the preferred migration path from legacy JSON normalized/derived artifacts
 - dataset paths are intentionally DuckDB-friendly
 
@@ -127,9 +128,26 @@ Rules:
 ### Query methods
 
 - `query day`: daily summary and observed-hour coverage
-- `query prob`: seasonal climatology plus analog-based estimate when enough profile data exists
-- `query analogs`: same-station nearest-neighbor analog search over hourly profiles
-- `source list` and `station inspect`: cache/source coverage inspection in text or JSON
+- `query prob`: weighted multi-method output across:
+  - `seasonal-climatology`
+  - `temperature-trajectory`
+  - `partial-profile-analogs`
+  - `nearest-neighbor-analogs`
+- `query analogs`: same-station nearest-neighbor analog search over hourly profiles with same-cadence preference
+- `source list`, `station inspect`, and `cache manifests`: cache/source/provenance inspection in text or JSON
+- `query duckdb-paths`: prints normalized/derived Parquet locations and example DuckDB commands
+
+### Combination policy
+
+- Default fixed weights:
+  - climatology `0.25`
+  - trajectory `0.20`
+  - partial-profile analogs `0.30`
+  - nearest-neighbor analogs `0.25`
+- Combined probability is emitted only when at least two methods are available.
+- Weights are renormalized across the available methods only.
+- Current-day output includes a freshness or stale-data note based on the newest same-day NWS observation.
+- Mixed-cadence candidate pools are explicitly marked when `GHCNh` contributes.
 
 ## Validation Rules
 
@@ -140,6 +158,9 @@ Rules:
 - overlapping timestamps are resolved by explicit source precedence
 - wind similarity uses vector components, not direct direction deltas
 - cloud cover fractions are derived from METAR layer codes when available
+- partial-day analogs require at least 2 matched hours
+- full-profile analogs require at least 6 matched hours
+- same-cadence analog candidates rank ahead of mixed-cadence fallback candidates
 
 ## Acceptance Criteria
 
@@ -157,6 +178,8 @@ The current bootstrap is considered successful when all of the following work:
 - `query prob ...`
 - `fetch current ...`
 - `query analogs ...`
+- `cache manifests ...`
+- `query duckdb-paths ...`
 
 And:
 
@@ -165,11 +188,11 @@ And:
 - structured logs are emitted
 - normalized and derived cache artifacts are written as Parquet
 - cache artifacts are directly queryable from DuckDB
+- atomic writes prevent torn Parquet/manifest reads during concurrent `today` queries
 
 ## Remaining Work
 
-- improve manifests and provenance visibility around overlap and refresh state
-- extend probability methods beyond climatology plus analog neighbors
+- improve calibration and validation against larger historical backfills
 - improve current-day modeling quality with denser same-day live snapshots
 - increase precip/cloud-layer coverage where upstream archives expose richer detail
-- add optional ergonomics around migration and DuckDB inspection helpers
+- refine provenance detail around overlap reconciliation and dataset aging

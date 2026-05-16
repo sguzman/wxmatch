@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::domain::{
-    AnalogResult, DailySummary, DayProfile, HourlyProfilePoint, MethodAvailability,
-    ObservationRecord, ProbabilityBreakdown, ProbabilityEstimate, StationId,
+    AnalogResult, CombinedProbability, DailySummary, DayProfile, HourlyProfilePoint,
+    MethodAvailability, ObservationRecord, ProbabilityBreakdown, ProbabilityEstimate, StationId,
 };
 use anyhow::{Result, bail};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
@@ -107,6 +107,7 @@ impl DerivedDatasetBuilder<DailySummary> for DailySummaryBuilder {
                 station_id,
                 local_date,
                 observation_count: rows.len(),
+                source_slugs: unique_source_slugs(&rows),
                 high_temp_c: temps.iter().copied().reduce(f64::max),
                 low_temp_c: temps.iter().copied().reduce(f64::min),
                 mean_temp_c: mean(&temps),
@@ -142,6 +143,7 @@ impl DerivedDatasetBuilder<DayProfile> for DayProfileBuilder {
 
         let mut profiles = Vec::new();
         for ((station_id, local_date), rows) in grouped {
+            let source_slugs = unique_source_slugs(&rows);
             let mut hourly: BTreeMap<u8, Vec<&ObservationRecord>> = BTreeMap::new();
             for row in rows {
                 hourly
@@ -195,6 +197,7 @@ impl DerivedDatasetBuilder<DayProfile> for DayProfileBuilder {
                 station_id: StationId::new(&station_id),
                 local_date,
                 observed_hour_count,
+                source_slugs,
                 hours,
             });
         }
@@ -249,6 +252,8 @@ impl ProbabilityMethod for ClimatologyMethod {
             method: self.name().to_owned(),
             probability: hits as f64 / matches as f64,
             sample_size: matches,
+            weight_used: Some(0.25),
+            confidence_note: Some("baseline seasonal climatology".to_owned()),
             note: Some(format!("window=+/-{} calendar days", self.window_days)),
         })
     }
@@ -332,6 +337,10 @@ impl ProbabilityMethod for TrajectoryMethod {
             method: self.name().to_owned(),
             probability: weighted_hits / total_weight,
             sample_size,
+            weight_used: Some(0.20),
+            confidence_note: Some(
+                "trajectory-only estimate from matched same-hour profiles".to_owned(),
+            ),
             note: Some(format!(
                 "compares latest temperature and warming rate through hour {}",
                 limit_hour
@@ -386,17 +395,26 @@ pub fn build_probability_breakdown(
         ProbabilityMethodOutcome::Unavailable(unavailable) => unavailable_methods.push(unavailable),
     }
 
-    let combined_probability = if estimates.len() >= 2 {
-        Some(
-            estimates
-                .iter()
-                .map(|estimate| estimate.probability)
-                .sum::<f64>()
-                / estimates.len() as f64,
-        )
+    let combined = if estimates.len() >= 2 {
+        let weights_sum = estimates
+            .iter()
+            .map(|estimate| estimate.weight_used.unwrap_or(0.0))
+            .sum::<f64>();
+        let probability = estimates
+            .iter()
+            .map(|estimate| estimate.probability * estimate.weight_used.unwrap_or(0.0))
+            .sum::<f64>()
+            / weights_sum.max(f64::EPSILON);
+        Some(CombinedProbability {
+            probability,
+            method_count: estimates.len(),
+            combination_note:
+                "fixed weighted blend across available methods with renormalized weights".to_owned(),
+        })
     } else {
         None
     };
+    let combined_probability = combined.as_ref().map(|combined| combined.probability);
 
     ProbabilityBreakdown {
         station_id,
@@ -404,6 +422,7 @@ pub fn build_probability_breakdown(
         threshold_high_c,
         methods: estimates,
         unavailable_methods,
+        combined,
         combined_probability,
     }
 }
@@ -427,6 +446,12 @@ pub fn top_analogs(
         .filter(|profile| profile.local_date != target_date)
         .filter_map(|profile| {
             let (distance, compared_hours) = profile_distance(target_profile, profile, as_of_hour)?;
+            let source_summary = source_summary(&profile.source_slugs);
+            let cadence_warning = if includes_ghcnh(&profile.source_slugs) {
+                Some("includes hourly GHCNh fallback data".to_owned())
+            } else {
+                None
+            };
             Some(AnalogResult {
                 station_id: station_id.clone(),
                 target_date,
@@ -434,11 +459,17 @@ pub fn top_analogs(
                 distance,
                 observed_high_c: daily_highs.get(&profile.local_date).copied().flatten(),
                 compared_hours,
+                candidate_source_summary: source_summary,
+                source_mix_note: cadence_warning,
             })
         })
         .collect::<Vec<_>>();
 
-    analogs.sort_by(|left, right| left.distance.total_cmp(&right.distance));
+    analogs.sort_by(|left, right| {
+        analog_mixed_rank(left)
+            .cmp(&analog_mixed_rank(right))
+            .then_with(|| left.distance.total_cmp(&right.distance))
+    });
     analogs.truncate(top_n);
     analogs
 }
@@ -506,6 +537,17 @@ fn analog_probability_estimate(
         method: analog_method_name(as_of_hour).to_owned(),
         probability: weighted_hits / total_weight,
         sample_size: analogs.len(),
+        weight_used: Some(if as_of_hour.is_some() { 0.30 } else { 0.25 }),
+        confidence_note: Some(
+            if analogs
+                .iter()
+                .any(|analog| analog.source_mix_note.is_some())
+            {
+                "mixed-cadence candidate pool includes hourly fallback data".to_owned()
+            } else {
+                "same-station analog pool from normalized profile matches".to_owned()
+            },
+        ),
         note: Some("weighted by inverse profile distance".to_owned()),
     })
 }
@@ -653,6 +695,36 @@ fn mean(values: &[f64]) -> Option<f64> {
         None
     } else {
         Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn unique_source_slugs(rows: &[&ObservationRecord]) -> Vec<String> {
+    let mut values = rows
+        .iter()
+        .map(|row| row.source.slug().to_owned())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn includes_ghcnh(source_slugs: &[String]) -> bool {
+    source_slugs.iter().any(|slug| slug == "ghcnh")
+}
+
+fn source_summary(source_slugs: &[String]) -> String {
+    if source_slugs.is_empty() {
+        "unknown".to_owned()
+    } else {
+        source_slugs.join(",")
+    }
+}
+
+fn analog_mixed_rank(analog: &AnalogResult) -> u8 {
+    if analog.source_mix_note.is_some() {
+        1
+    } else {
+        0
     }
 }
 
@@ -871,6 +943,49 @@ mod tests {
                 .iter()
                 .any(|method| method.method == "temperature-trajectory")
         );
+        assert!(breakdown.combined.is_none());
+    }
+
+    #[test]
+    fn combined_probability_renormalizes_across_available_methods() {
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 25.0),
+            observation("KDSM", "2024-05-14 01:00", 26.0),
+            observation("KDSM", "2025-05-14 00:00", 25.0),
+            observation("KDSM", "2025-05-14 01:00", 26.0),
+            observation("KDSM", "2026-05-14 00:00", 25.0),
+            observation("KDSM", "2026-05-14 01:00", 26.0),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+        let breakdown = build_probability_breakdown(
+            StationId::new("KDSM"),
+            target_date,
+            24.0,
+            &daily,
+            &profiles,
+            Some(target_profile),
+            Some(1),
+        );
+        let combined = breakdown.combined.as_ref().unwrap();
+        let weight_sum = breakdown
+            .methods
+            .iter()
+            .map(|method| method.weight_used.unwrap_or(0.0))
+            .sum::<f64>();
+        let expected = breakdown
+            .methods
+            .iter()
+            .map(|method| method.probability * method.weight_used.unwrap_or(0.0))
+            .sum::<f64>()
+            / weight_sum;
+        assert!((combined.probability - expected).abs() < 1e-9);
+        assert_eq!(combined.method_count, breakdown.methods.len());
     }
 
     #[test]

@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 use serde::Serialize;
 use serde_json::json;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::app::App;
 use crate::cache::CacheLayout;
@@ -25,12 +28,12 @@ use crate::engine::{
 };
 use crate::source::{DataSource, SourceDescriptor, all_sources};
 use crate::sources::WeatherSourceAdapter;
-use crate::storage::{list_files_recursive, read_parquet, write_json, write_parquet};
+use crate::storage::{list_files_recursive, read_json, read_parquet, write_json, write_parquet};
 
 pub async fn dispatch(app: &App, cli: Cli) -> Result<()> {
     let format = cli.format;
     match cli.command {
-        Command::Cache(command) => handle_cache(app, command).await,
+        Command::Cache(command) => handle_cache(format, app, command).await,
         Command::Source(command) => handle_source(format, app, command).await,
         Command::Station(command) => handle_station(format, app, command).await,
         Command::Fetch(command) => handle_fetch(app, command).await,
@@ -49,7 +52,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 #[instrument(skip(app))]
-async fn handle_cache(app: &App, command: CacheCommand) -> Result<()> {
+async fn handle_cache(format: OutputFormat, app: &App, command: CacheCommand) -> Result<()> {
     match command.command {
         CacheSubcommand::Init => {
             app.cache.ensure_exists()?;
@@ -57,6 +60,9 @@ async fn handle_cache(app: &App, command: CacheCommand) -> Result<()> {
         }
         CacheSubcommand::Show => print_cache_layout(&app.cache),
         CacheSubcommand::Doctor => run_cache_doctor(&app.cache)?,
+        CacheSubcommand::Manifests { station } => {
+            list_manifests(format, app, station.as_deref()).await?;
+        }
     }
 
     Ok(())
@@ -287,6 +293,9 @@ async fn handle_query(format: OutputFormat, app: &App, command: QueryCommand) ->
         }
         QuerySubcommand::Prob(args) => query_probability(format, app, args).await,
         QuerySubcommand::Analogs(args) => query_analogs(format, app, args).await,
+        QuerySubcommand::DuckdbPaths { station, year } => {
+            query_duckdb_paths(format, app, station.as_deref(), year).await
+        }
     }
 }
 
@@ -512,19 +521,33 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         target_profile.as_ref(),
         as_of_hour,
     );
+    let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
 
     if format == OutputFormat::Json {
-        print_json(&breakdown)?;
+        let output = json!({
+            "breakdown": breakdown,
+            "freshness_note": freshness_note,
+        });
+        print_json(&output)?;
     } else {
         println!("station: {}", breakdown.station_id);
         println!("date: {}", breakdown.target_date);
         println!("threshold high: {:.1}F", args.threshold_high);
         for method in &breakdown.methods {
             println!(
-                "{}: {:.1}% (n={}){}",
+                "{}: {:.1}% (n={}){}{}{}",
                 method.method,
                 method.probability * 100.0,
                 method.sample_size,
+                method
+                    .weight_used
+                    .map(|weight| format!(" weight={weight:.2}"))
+                    .unwrap_or_default(),
+                method
+                    .confidence_note
+                    .as_ref()
+                    .map(|note| format!(" confidence={note}"))
+                    .unwrap_or_default(),
                 method
                     .note
                     .as_ref()
@@ -538,10 +561,18 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
                 unavailable.method, unavailable.reason
             );
         }
-        if let Some(combined) = breakdown.combined_probability {
-            println!("combined: {:.1}%", combined * 100.0);
+        if let Some(combined) = &breakdown.combined {
+            println!(
+                "combined: {:.1}% (methods={} [{}])",
+                combined.probability * 100.0,
+                combined.method_count,
+                combined.combination_note
+            );
         } else {
             println!("combined: unavailable (need at least two methods)");
+        }
+        if let Some(freshness_note) = freshness_note {
+            println!("freshness: {freshness_note}");
         }
     }
     Ok(())
@@ -583,8 +614,17 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
                 .map(|value| format!("{value:.1}F"))
                 .unwrap_or_else(|| "n/a".to_owned());
             println!(
-                "{}  distance={:.3} high={} compared_hours={}",
-                analog.analog_date, analog.distance, high, analog.compared_hours
+                "{}  distance={:.3} high={} compared_hours={} sources={}{}",
+                analog.analog_date,
+                analog.distance,
+                high,
+                analog.compared_hours,
+                analog.candidate_source_summary,
+                analog
+                    .source_mix_note
+                    .as_ref()
+                    .map(|note| format!(" [{note}]"))
+                    .unwrap_or_default()
             );
         }
     }
@@ -608,6 +648,80 @@ fn run_cache_doctor(cache: &CacheLayout) -> Result<()> {
         if manifest.exists() { "ok" } else { "missing" },
         manifest.display()
     );
+    for path in list_files_recursive(&cache.sources_dir, "parquet")? {
+        let source = source_from_artifact_path(&path);
+        let station_id = station_id_from_artifact_path(&path);
+        let year = year_from_artifact_path(&path);
+        if let (Some(source), Some(station_id), Some(year)) = (source, station_id, year) {
+            let manifest = cache.normalized_manifest_path(source, &station_id, year);
+            if !manifest.exists() {
+                println!(
+                    "   warning  missing normalized manifest for {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    for path in list_files_recursive(&cache.derived_dir, "parquet")? {
+        let station_id = station_id_from_artifact_path(&path);
+        let year = year_from_artifact_path(&path);
+        if let (Some(station_id), Some(year)) = (station_id, year) {
+            let kind = if path.to_string_lossy().contains("/daily/") {
+                "daily"
+            } else {
+                "profiles"
+            };
+            let manifest = cache.derived_manifest_path(kind, &station_id, year);
+            if !manifest.exists() {
+                println!(
+                    "   warning  missing derived manifest for {}",
+                    path.display()
+                );
+                continue;
+            }
+            let manifest_data: DatasetManifest = read_json(&manifest)?;
+            let manifest_time = std::fs::metadata(&manifest)?.modified().ok();
+            for input in &manifest_data.input_paths {
+                if let Ok(metadata) = std::fs::metadata(input) {
+                    if metadata
+                        .modified()
+                        .ok()
+                        .zip(manifest_time)
+                        .is_some_and(|(input_time, output_time)| input_time > output_time)
+                    {
+                        println!(
+                            "   warning  derived manifest {} is older than input {}",
+                            manifest.display(),
+                            input
+                        );
+                    }
+                }
+                let input_path = Path::new(input);
+                let source = source_from_artifact_path(input_path);
+                let input_station_id = station_id_from_artifact_path(input_path);
+                let input_year = year_from_artifact_path(input_path);
+                if let (Some(source), Some(input_station_id), Some(input_year), Some(output_time)) =
+                    (source, input_station_id, input_year, manifest_time)
+                {
+                    let input_manifest =
+                        cache.normalized_manifest_path(source, &input_station_id, input_year);
+                    if let Ok(metadata) = std::fs::metadata(&input_manifest) {
+                        if metadata
+                            .modified()
+                            .ok()
+                            .is_some_and(|time| time > output_time)
+                        {
+                            println!(
+                                "   warning  derived manifest {} is older than normalized manifest {}",
+                                manifest.display(),
+                                input_manifest.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -827,6 +941,7 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
         .sources
         .nws
         .normalize_raw_file(Path::new(&result.path), &station)?;
+    let _lock = acquire_path_lock(&normalized_path)?;
     let added = merge_observations_into_year(&normalized_path, normalized)?;
     let existing_today_count = if normalized_path.exists() {
         read_observations_for_date(&normalized_path, today)?.len()
@@ -945,7 +1060,19 @@ fn merge_observations_into_year(
     observations: Vec<ObservationRecord>,
 ) -> Result<usize> {
     let existing = if path.exists() {
-        read_observation_records(path)?
+        match read_observation_records(path) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let quarantine_path = quarantine_corrupt_artifact(path)?;
+                warn!(
+                    path = %path.display(),
+                    quarantine_path = %quarantine_path.display(),
+                    error = %error,
+                    "existing normalized parquet was unreadable; quarantined and rebuilding from new observations"
+                );
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -994,6 +1121,150 @@ fn read_day_profiles(path: &Path) -> Result<Vec<DayProfile>> {
     DayProfileRow::into_profiles(rows)
 }
 
+async fn list_manifests(format: OutputFormat, app: &App, station: Option<&str>) -> Result<()> {
+    backfill_cached_manifests(app)?;
+    let station_filter = station.map(StationId::new);
+    let mut manifests = list_files_recursive(&app.cache.manifests_dir, "json")?;
+    manifests.retain(|path| {
+        station_filter.as_ref().is_none_or(|station_id| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(&station_id.to_string()))
+        })
+    });
+    manifests.sort();
+    let entries = manifests
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let kind = manifest_kind(&name);
+            if kind == "bootstrap" {
+                Ok(json!({
+                    "kind": kind,
+                    "path": path.display().to_string(),
+                }))
+            } else {
+                let payload = read_json::<serde_json::Value>(&path)?;
+                Ok(json!({
+                    "kind": kind,
+                    "path": path.display().to_string(),
+                    "manifest": payload,
+                }))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if format == OutputFormat::Json {
+        print_json(&entries)?;
+    } else {
+        for entry in entries {
+            let kind = entry["kind"].as_str().unwrap_or_default();
+            let path = entry["path"].as_str().unwrap_or_default();
+            if let Some(manifest) = entry.get("manifest") {
+                println!(
+                    "{kind:18} station={} year={} rows={} path={path}",
+                    manifest["station_id"].as_str().unwrap_or("-"),
+                    manifest["year"].as_i64().unwrap_or_default(),
+                    manifest["row_count"].as_u64().unwrap_or_default(),
+                );
+            } else {
+                println!("{kind:18} path={path}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn query_duckdb_paths(
+    format: OutputFormat,
+    app: &App,
+    station: Option<&str>,
+    year: Option<i32>,
+) -> Result<()> {
+    backfill_cached_manifests(app)?;
+    let station_filter = station.map(StationId::new);
+    let mut normalized = Vec::new();
+    let mut derived = Vec::new();
+    for source in all_sources() {
+        let root = app.cache.source_root(source).join("normalized");
+        for path in list_files_recursive(&root, "parquet")? {
+            if station_filter.as_ref().is_some_and(|station_id| {
+                station_id_from_artifact_path(&path).as_ref() != Some(station_id)
+            }) {
+                continue;
+            }
+            if year.is_some_and(|year| year_from_artifact_path(&path) != Some(year)) {
+                continue;
+            }
+            normalized.push(json!({
+                "source": source.slug(),
+                "path": path.display().to_string(),
+            }));
+        }
+    }
+    for path in list_files_recursive(&app.cache.derived_dir, "parquet")? {
+        if station_filter.as_ref().is_some_and(|station_id| {
+            station_id_from_artifact_path(&path).as_ref() != Some(station_id)
+        }) {
+            continue;
+        }
+        if year.is_some_and(|year| year_from_artifact_path(&path) != Some(year)) {
+            continue;
+        }
+        derived.push(json!({
+            "kind": if path.to_string_lossy().contains("/daily/") { "daily" } else { "profiles" },
+            "path": path.display().to_string(),
+        }));
+    }
+    let examples = normalized
+        .first()
+        .map(|entry| {
+            vec![
+                format!(
+                    "duckdb -c \"select * from '{}' limit 5\"",
+                    entry["path"].as_str().unwrap_or_default()
+                ),
+                format!(
+                    "duckdb -c \"describe select * from '{}'\"",
+                    entry["path"].as_str().unwrap_or_default()
+                ),
+            ]
+        })
+        .unwrap_or_default();
+    let output = json!({
+        "normalized": normalized,
+        "derived": derived,
+        "examples": examples,
+    });
+    if format == OutputFormat::Json {
+        print_json(&output)?;
+    } else {
+        println!("normalized:");
+        for entry in output["normalized"].as_array().unwrap_or(&Vec::new()) {
+            println!(
+                "{}  {}",
+                entry["source"].as_str().unwrap_or_default(),
+                entry["path"].as_str().unwrap_or_default()
+            );
+        }
+        println!("derived:");
+        for entry in output["derived"].as_array().unwrap_or(&Vec::new()) {
+            println!(
+                "{}  {}",
+                entry["kind"].as_str().unwrap_or_default(),
+                entry["path"].as_str().unwrap_or_default()
+            );
+        }
+        for example in output["examples"].as_array().unwrap_or(&Vec::new()) {
+            println!("{}", example.as_str().unwrap_or_default());
+        }
+    }
+    Ok(())
+}
+
 fn input_paths_for_year(
     source: DataSource,
     station_id: &StationId,
@@ -1026,7 +1297,7 @@ fn backfill_normalized_manifests(
             continue;
         };
         let manifest_path = app.cache.normalized_manifest_path(source, station_id, year);
-        if manifest_path.exists() {
+        if manifest_path.exists() && !dataset_manifest_needs_refresh(&manifest_path)? {
             continue;
         }
         let observations = read_observation_records(&path)?;
@@ -1056,7 +1327,7 @@ fn backfill_cached_manifests(app: &App) -> Result<()> {
             let manifest_path = app
                 .cache
                 .normalized_manifest_path(source, &station_id, year);
-            if manifest_path.exists() {
+            if manifest_path.exists() && !dataset_manifest_needs_refresh(&manifest_path)? {
                 continue;
             }
             let observations = read_observation_records(&path)?;
@@ -1082,7 +1353,7 @@ fn backfill_cached_manifests(app: &App) -> Result<()> {
         };
         if path.to_string_lossy().contains("/daily/") {
             let manifest_path = app.cache.derived_manifest_path("daily", &station_id, year);
-            if !manifest_path.exists() {
+            if !manifest_path.exists() || dataset_manifest_needs_refresh(&manifest_path)? {
                 let values = read_daily_summaries(&path)?;
                 write_derived_manifest(
                     app,
@@ -1099,7 +1370,7 @@ fn backfill_cached_manifests(app: &App) -> Result<()> {
             let manifest_path = app
                 .cache
                 .derived_manifest_path("profiles", &station_id, year);
-            if !manifest_path.exists() {
+            if !manifest_path.exists() || dataset_manifest_needs_refresh(&manifest_path)? {
                 let profiles = read_day_profiles(&path)?;
                 write_profile_manifest(app, &station_id, year, &path, &profiles)?;
             }
@@ -1112,7 +1383,9 @@ fn backfill_cached_manifests(app: &App) -> Result<()> {
 fn backfill_derived_manifests(app: &App, station_id: &StationId, year: i32) -> Result<()> {
     let daily_path = app.cache.daily_summary_path(station_id, year);
     let daily_manifest = app.cache.derived_manifest_path("daily", station_id, year);
-    if daily_path.exists() && !daily_manifest.exists() {
+    if daily_path.exists()
+        && (!daily_manifest.exists() || dataset_manifest_needs_refresh(&daily_manifest)?)
+    {
         let values = read_daily_summaries(&daily_path)?;
         write_derived_manifest(
             app,
@@ -1130,7 +1403,9 @@ fn backfill_derived_manifests(app: &App, station_id: &StationId, year: i32) -> R
     let profile_manifest = app
         .cache
         .derived_manifest_path("profiles", station_id, year);
-    if profile_path.exists() && !profile_manifest.exists() {
+    if profile_path.exists()
+        && (!profile_manifest.exists() || dataset_manifest_needs_refresh(&profile_manifest)?)
+    {
         let profiles = read_day_profiles(&profile_path)?;
         write_profile_manifest(app, station_id, year, &profile_path, &profiles)?;
     }
@@ -1148,6 +1423,31 @@ fn station_id_from_artifact_path(path: &Path) -> Option<StationId> {
     path.ancestors()
         .filter_map(|ancestor| ancestor.file_name().and_then(|value| value.to_str()))
         .find_map(|value| value.strip_prefix("station=").map(StationId::new))
+}
+
+fn source_from_artifact_path(path: &Path) -> Option<DataSource> {
+    path.ancestors()
+        .filter_map(|ancestor| ancestor.file_name().and_then(|value| value.to_str()))
+        .find_map(DataSource::from_slug)
+}
+
+fn manifest_kind(file_name: &str) -> &'static str {
+    if file_name.starts_with("normalized-") {
+        "normalized"
+    } else if file_name.starts_with("derived-") {
+        "derived"
+    } else if file_name.starts_with("fetch-") {
+        "fetch"
+    } else if file_name == "bootstrap.json" {
+        "bootstrap"
+    } else {
+        "unknown"
+    }
+}
+
+fn dataset_manifest_needs_refresh(path: &Path) -> Result<bool> {
+    let value = read_json::<serde_json::Value>(path)?;
+    Ok(value.get("warnings").is_none() || value.get("source_count").is_none())
 }
 
 fn all_normalized_inputs_for_year(app: &App, station_id: &StationId, year: i32) -> Vec<String> {
@@ -1182,6 +1482,12 @@ fn write_normalized_manifest(
         end_date,
         artifact_path: artifact_path.display().to_string(),
         input_paths,
+        warnings: normalized_manifest_warnings(source, observations),
+        source_count: observations
+            .iter()
+            .map(|row| row.source.slug())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
     };
     write_json(
         &app.cache.normalized_manifest_path(source, station_id, year),
@@ -1211,6 +1517,15 @@ fn write_derived_manifest(
         end_date,
         artifact_path: artifact_path.display().to_string(),
         input_paths: all_normalized_inputs_for_year(app, station_id, year),
+        warnings: Vec::new(),
+        source_count: all_sources()
+            .into_iter()
+            .filter(|source| {
+                app.cache
+                    .normalized_path(*source, station_id, year)
+                    .exists()
+            })
+            .count(),
     };
     write_json(
         &app.cache
@@ -1239,4 +1554,124 @@ fn write_profile_manifest(
         start_date,
         end_date,
     )
+}
+
+fn normalized_manifest_warnings(
+    source: DataSource,
+    observations: &[ObservationRecord],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if source == DataSource::Ghcnh {
+        warnings.push(
+            "hourly fallback cadence; analog and probability methods may be lower confidence"
+                .to_owned(),
+        );
+    }
+    if observations.iter().any(|row| {
+        row.quality_flags
+            .iter()
+            .any(|flag| matches!(flag, crate::domain::QualityFlag::SourceFieldMissing(_)))
+    }) {
+        warnings.push(
+            "some normalized fields were unavailable or unsupported in the source payload"
+                .to_owned(),
+        );
+    }
+    warnings
+}
+
+fn current_day_freshness_note(
+    app: &App,
+    station_id: &StationId,
+    target_date: NaiveDate,
+) -> Result<Option<String>> {
+    if target_date != Local::now().date_naive() {
+        return Ok(None);
+    }
+    let path = app
+        .cache
+        .normalized_path(DataSource::NwsApi, station_id, target_date.year());
+    if !path.exists() {
+        return Ok(Some(
+            "no same-day NWS observation has been normalized yet".to_owned(),
+        ));
+    }
+    let latest = read_observations_for_date(&path, target_date)?
+        .into_iter()
+        .map(|row| row.observed_at_utc)
+        .max();
+    let Some(latest) = latest else {
+        return Ok(Some(
+            "no same-day NWS observation has been normalized yet".to_owned(),
+        ));
+    };
+    let age = chrono::Utc::now() - latest;
+    let minutes = age.num_minutes();
+    if minutes > 90 {
+        Ok(Some(format!(
+            "stale current-day data: latest NWS observation is {minutes} minutes old ({latest})"
+        )))
+    } else {
+        Ok(Some(format!(
+            "latest NWS observation age: {minutes} minutes ({latest})"
+        )))
+    }
+}
+
+struct PathLock {
+    path: PathBuf,
+}
+
+impl Drop for PathLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_path_lock(target: &Path) -> Result<PathLock> {
+    let lock_path = target.with_extension(format!(
+        "{}.lock",
+        target
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("artifact")
+    ));
+    for _ in 0..200 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(PathLock { path: lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to acquire lock {}", lock_path.display()));
+            }
+        }
+    }
+    bail!("timed out waiting for lock {}", lock_path.display())
+}
+
+fn quarantine_corrupt_artifact(path: &Path) -> Result<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let quarantine_path = path.with_extension(format!(
+        "{}.corrupt-{nanos}",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("artifact")
+    ));
+    fs::rename(path, &quarantine_path).with_context(|| {
+        format!(
+            "failed to quarantine unreadable artifact {} to {}",
+            path.display(),
+            quarantine_path.display()
+        )
+    })?;
+    Ok(quarantine_path)
 }
