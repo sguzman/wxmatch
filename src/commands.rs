@@ -77,28 +77,43 @@ async fn handle_source(format: OutputFormat, app: &App, command: SourceCommand) 
                 .into_iter()
                 .map(SourceDescriptor::from_source)
                 .map(|descriptor| {
-                let normalized_root = app.cache.source_root(descriptor.source).join("normalized");
-                let raw_root = app.cache.source_root(descriptor.source).join("raw");
-                let manifest_root = app.cache.manifests_dir.as_path();
-                json!({
-                    "source": descriptor.source.slug(),
-                    "slug": descriptor.slug,
-                    "cadence": descriptor.cadence,
-                    "scope": descriptor.scope,
-                    "summary": descriptor.summary,
-                    "raw_files": count_files(&raw_root, source_raw_extension(descriptor.source)).unwrap_or(0),
-                    "normalized_parquet_files": count_files(&normalized_root, "parquet").unwrap_or(0),
-                    "normalized_manifests": count_matching_files(manifest_root, "json", &format!("normalized-{}-", descriptor.source.slug())).unwrap_or(0),
+                    let normalized_root = app.cache.source_root(descriptor.source).join("normalized");
+                    let raw_root = app.cache.source_root(descriptor.source).join("raw");
+                    let manifest_root = app.cache.manifests_dir.as_path();
+                    let normalized_manifest_count = count_matching_files(
+                        manifest_root,
+                        "json",
+                        &format!("normalized-{}-", descriptor.source.slug()),
+                    )
+                    .unwrap_or(0);
+                    let normalized_manifests =
+                        source_normalized_manifests(app, descriptor.source).unwrap_or_default();
+                    let coverage_years = manifest_years(&normalized_manifests);
+                    let manifest_warnings = manifest_warnings(&normalized_manifests);
+                    let role = source_role(descriptor.source);
+                    json!({
+                        "source": descriptor.source.slug(),
+                        "slug": descriptor.slug,
+                        "cadence": descriptor.cadence,
+                        "scope": descriptor.scope,
+                        "summary": descriptor.summary,
+                        "role": role,
+                        "raw_files": count_files(&raw_root, source_raw_extension(descriptor.source)).unwrap_or(0),
+                        "normalized_parquet_files": count_files(&normalized_root, "parquet").unwrap_or(0),
+                        "normalized_manifests": normalized_manifest_count,
+                        "coverage_years": coverage_years,
+                        "warnings": manifest_warnings,
+                    })
                 })
-            })
                 .collect::<Vec<_>>();
             if format == OutputFormat::Json {
                 print_json(&descriptors)?;
             } else {
                 for descriptor in descriptors {
                     println!(
-                        "{slug:16}  cadence={cadence:12} scope={scope:18} raw={raw_files:4} normalized={normalized_files:4} manifests={manifest_files:4} {summary}",
+                        "{slug:16}  role={role:20} cadence={cadence:12} scope={scope:18} raw={raw_files:4} normalized={normalized_files:4} manifests={manifest_files:4} years={years} {summary}",
                         slug = descriptor["slug"].as_str().unwrap_or_default(),
+                        role = descriptor["role"].as_str().unwrap_or_default(),
                         cadence = descriptor["cadence"].as_str().unwrap_or_default(),
                         scope = descriptor["scope"].as_str().unwrap_or_default(),
                         raw_files = descriptor["raw_files"].as_u64().unwrap_or_default(),
@@ -108,8 +123,14 @@ async fn handle_source(format: OutputFormat, app: &App, command: SourceCommand) 
                         manifest_files = descriptor["normalized_manifests"]
                             .as_u64()
                             .unwrap_or_default(),
+                        years = format_years_json(&descriptor["coverage_years"]),
                         summary = descriptor["summary"].as_str().unwrap_or_default(),
                     );
+                    if let Some(warnings) = descriptor["warnings"].as_array() {
+                        for warning in warnings {
+                            println!("  warning: {}", warning.as_str().unwrap_or_default());
+                        }
+                    }
                 }
             }
         }
@@ -177,6 +198,10 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                 "derived-",
                 &station_id,
             )?;
+            let normalized_manifest_payloads = station_normalized_manifests(app, &station_id)?;
+            let derived_manifest_payloads = station_derived_manifests(app, &station_id)?;
+            let freshness_note =
+                current_day_freshness_note(app, &station_id, Local::now().date_naive())?;
             let output = json!({
                 "station": station_record.station_id,
                 "source_station_id": station_record.source_station_id,
@@ -187,6 +212,10 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                 "elevation_m": station_record.elevation_m,
                 "provider": station_record.provider.unwrap_or_else(|| "unknown".to_owned()),
                 "station_cache": app.cache.station_metadata_path(&station_id).display().to_string(),
+                "current_day_status": {
+                    "freshness_note": freshness_note,
+                },
+                "source_coverage": source_coverage_summary(app, &station_id)?,
                 "cache_status": {
                     "iem_raw_files": raw_iem,
                     "iem_normalized_files": normalized_iem,
@@ -197,6 +226,8 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                     "profile_years_built": profile_years,
                     "normalized_manifests": normalized_manifests,
                     "derived_manifests": derived_manifests,
+                    "normalized_manifest_warnings": manifest_warnings(&normalized_manifest_payloads),
+                    "derived_manifest_years": manifest_years(&derived_manifest_payloads),
                 }
             });
             if format == OutputFormat::Json {
@@ -240,6 +271,22 @@ async fn handle_station(format: OutputFormat, app: &App, command: StationCommand
                 println!("profile years built: {profile_years}");
                 println!("normalized manifests: {normalized_manifests}");
                 println!("derived manifests: {derived_manifests}");
+                if let Some(note) = output["current_day_status"]["freshness_note"].as_str() {
+                    println!("current-day status: {note}");
+                }
+                if let Some(coverage) = output["source_coverage"].as_array() {
+                    for source in coverage {
+                        println!(
+                            "{}: years={} warnings={}",
+                            source["source"].as_str().unwrap_or_default(),
+                            format_years_json(&source["coverage_years"]),
+                            source["warnings"]
+                                .as_array()
+                                .map(|warnings| warnings.len())
+                                .unwrap_or_default()
+                        );
+                    }
+                }
             }
         }
     }
@@ -470,6 +517,7 @@ async fn query_day(
         .iter()
         .find(|profile| profile.local_date == date)
         .context("no day profile found for date")?;
+    let freshness_note = current_day_freshness_note(app, station_id, date)?;
 
     let output = json!({
         "station": station_id.to_string(),
@@ -479,6 +527,8 @@ async fn query_day(
         "low_f": summary.low_temp_c.map(celsius_to_fahrenheit),
         "mean_f": summary.mean_temp_c.map(celsius_to_fahrenheit),
         "observed_hours": profile.observed_hour_count,
+        "sources": summary.source_slugs,
+        "freshness_note": freshness_note,
     });
     if format == OutputFormat::Json {
         print_json(&output)?;
@@ -496,6 +546,19 @@ async fn query_day(
             println!("mean: {:.1}F", celsius_to_fahrenheit(mean));
         }
         println!("observed hours: {}", profile.observed_hour_count);
+        if let Some(sources) = output["sources"].as_array() {
+            let sources = sources
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            if !sources.is_empty() {
+                println!("sources: {sources}");
+            }
+        }
+        if let Some(freshness_note) = output["freshness_note"].as_str() {
+            println!("freshness: {freshness_note}");
+        }
     }
     Ok(())
 }
@@ -600,13 +663,38 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
         as_of_hour,
         args.top,
     );
+    let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
+    let status_note = if analogs.is_empty() {
+        Some(format!(
+            "no comparable analogs found for target profile with {} observed hours",
+            target_profile.observed_hour_count
+        ))
+    } else {
+        None
+    };
 
     if format == OutputFormat::Json {
-        print_json(&analogs)?;
+        let output = json!({
+            "analogs": analogs,
+            "freshness_note": freshness_note,
+            "status_note": status_note,
+            "target_observed_hours": target_profile.observed_hour_count,
+        });
+        print_json(&output)?;
     } else {
         println!("station: {station_id}");
         println!("date: {target_date}");
         println!("top analogs: {}", analogs.len());
+        println!(
+            "target observed hours: {}",
+            target_profile.observed_hour_count
+        );
+        if let Some(freshness_note) = freshness_note {
+            println!("freshness: {freshness_note}");
+        }
+        if let Some(status_note) = status_note {
+            println!("status: {status_note}");
+        }
         for analog in analogs {
             let high = analog
                 .observed_high_c
@@ -1616,6 +1704,124 @@ fn current_day_freshness_note(
             "latest NWS observation age: {minutes} minutes ({latest})"
         )))
     }
+}
+
+fn source_role(source: DataSource) -> &'static str {
+    match source {
+        DataSource::IemAsosOneMinute => "historical-fast-path",
+        DataSource::NceiAsosFiveMinute => "historical-authoritative",
+        DataSource::NwsApi => "current-day-live",
+        DataSource::Ghcnh => "fallback-hourly",
+    }
+}
+
+fn source_normalized_manifests(app: &App, source: DataSource) -> Result<Vec<DatasetManifest>> {
+    list_files_recursive(&app.cache.manifests_dir, "json")?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&format!("normalized-{}-", source.slug())))
+        })
+        .map(|path| read_json(&path))
+        .collect()
+}
+
+fn station_normalized_manifests(app: &App, station_id: &StationId) -> Result<Vec<DatasetManifest>> {
+    list_files_recursive(&app.cache.manifests_dir, "json")?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("normalized-") && name.contains(&format!("-{station_id}-"))
+                })
+        })
+        .map(|path| read_json(&path))
+        .collect()
+}
+
+fn station_derived_manifests(app: &App, station_id: &StationId) -> Result<Vec<DatasetManifest>> {
+    list_files_recursive(&app.cache.manifests_dir, "json")?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("derived-") && name.contains(&format!("-{station_id}-"))
+                })
+        })
+        .map(|path| read_json(&path))
+        .collect()
+}
+
+fn manifest_years(manifests: &[DatasetManifest]) -> Vec<i32> {
+    let mut years = manifests
+        .iter()
+        .map(|manifest| manifest.year)
+        .collect::<Vec<_>>();
+    years.sort();
+    years.dedup();
+    years
+}
+
+fn manifest_warnings(manifests: &[DatasetManifest]) -> Vec<String> {
+    let mut warnings = manifests
+        .iter()
+        .flat_map(|manifest| manifest.warnings.iter().cloned())
+        .collect::<Vec<_>>();
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+fn format_years_json(value: &serde_json::Value) -> String {
+    value
+        .as_array()
+        .map(|years| {
+            years
+                .iter()
+                .filter_map(|year| year.as_i64())
+                .map(|year| year.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn source_coverage_summary(app: &App, station_id: &StationId) -> Result<Vec<serde_json::Value>> {
+    let mut coverage = Vec::new();
+    for source in all_sources() {
+        let manifests = station_normalized_manifests_for_source(app, station_id, source)?;
+        coverage.push(json!({
+            "source": source.slug(),
+            "role": source_role(source),
+            "coverage_years": manifest_years(&manifests),
+            "warnings": manifest_warnings(&manifests),
+            "manifest_count": manifests.len(),
+        }));
+    }
+    Ok(coverage)
+}
+
+fn station_normalized_manifests_for_source(
+    app: &App,
+    station_id: &StationId,
+    source: DataSource,
+) -> Result<Vec<DatasetManifest>> {
+    list_files_recursive(&app.cache.manifests_dir, "json")?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(&format!("normalized-{}-", source.slug()))
+                        && name.contains(&format!("-{station_id}-"))
+                })
+        })
+        .map(|path| read_json(&path))
+        .collect()
 }
 
 struct PathLock {
