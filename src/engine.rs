@@ -31,19 +31,41 @@ pub trait ProbabilityMethod {
 
 pub fn dedupe_observations(observations: Vec<ObservationRecord>) -> Vec<ObservationRecord> {
     let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
+    let mut canonical: HashMap<(String, chrono::DateTime<chrono::Utc>), ObservationRecord> =
+        HashMap::new();
     for observation in observations {
-        let key = (
+        let exact_key = (
             observation.source,
             observation.station_id.to_string(),
             observation.observed_at_utc,
         );
-        if seen.insert(key) {
-            deduped.push(observation);
+        if !seen.insert(exact_key) {
+            continue;
+        }
+        let merge_key = (
+            observation.station_id.to_string(),
+            observation.observed_at_utc,
+        );
+        match canonical.get(&merge_key) {
+            Some(existing)
+                if source_priority(existing.source) <= source_priority(observation.source) => {}
+            _ => {
+                canonical.insert(merge_key, observation);
+            }
         }
     }
+    let mut deduped = canonical.into_values().collect::<Vec<_>>();
     deduped.sort_by_key(|observation| observation.observed_at_utc);
     deduped
+}
+
+fn source_priority(source: crate::source::DataSource) -> u8 {
+    match source {
+        crate::source::DataSource::NceiAsosFiveMinute => 0,
+        crate::source::DataSource::IemAsosOneMinute => 1,
+        crate::source::DataSource::NwsApi => 2,
+        crate::source::DataSource::Ghcnh => 3,
+    }
 }
 
 pub struct DailySummaryBuilder;
@@ -558,6 +580,20 @@ mod tests {
         let deduped = dedupe_observations(vec![left.clone(), right]);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].temperature_c, left.temperature_c);
+    }
+
+    #[test]
+    fn prefers_ncei_over_iem_for_same_timestamp() {
+        let mut iem = observation("KDSM", "2026-05-14 00:00", 20.0);
+        let mut ncei = observation("KDSM", "2026-05-14 00:00", 19.0);
+        ncei.source = DataSource::NceiAsosFiveMinute;
+        let deduped = dedupe_observations(vec![iem.clone(), ncei.clone()]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].source, DataSource::NceiAsosFiveMinute);
+        assert_eq!(deduped[0].temperature_c, ncei.temperature_c);
+        iem.source = DataSource::Ghcnh;
+        let deduped = dedupe_observations(vec![iem, ncei.clone()]);
+        assert_eq!(deduped[0].source, DataSource::NceiAsosFiveMinute);
     }
 
     #[test]

@@ -3,11 +3,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use csv::{ReaderBuilder, StringRecord};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{debug, info, instrument};
 
 use crate::cache::CacheLayout;
@@ -59,13 +60,17 @@ pub trait WeatherSourceAdapter: Send + Sync {
 pub struct SourceRegistry {
     pub iem: IemAsosOneMinuteAdapter,
     pub nws: NwsApiAdapter,
+    pub ncei: NceiAsosFiveMinuteAdapter,
+    pub ghcnh: GhcnhAdapter,
 }
 
 impl SourceRegistry {
     pub fn new(cache: CacheLayout, http: Client) -> Self {
         Self {
             iem: IemAsosOneMinuteAdapter::new(cache.clone(), http.clone()),
-            nws: NwsApiAdapter::new(cache, http),
+            nws: NwsApiAdapter::new(cache.clone(), http.clone()),
+            ncei: NceiAsosFiveMinuteAdapter::new(cache.clone(), http.clone()),
+            ghcnh: GhcnhAdapter::new(cache, http),
         }
     }
 
@@ -73,7 +78,8 @@ impl SourceRegistry {
         match source {
             DataSource::IemAsosOneMinute => &self.iem,
             DataSource::NwsApi => &self.nws,
-            DataSource::NceiAsosFiveMinute | DataSource::Ghcnh => &self.nws,
+            DataSource::NceiAsosFiveMinute => &self.ncei,
+            DataSource::Ghcnh => &self.ghcnh,
         }
     }
 }
@@ -346,20 +352,6 @@ impl WeatherSourceAdapter for NwsApiAdapter {
         station_id: &StationId,
         refresh: bool,
     ) -> Result<CurrentFetchResult> {
-        let today = chrono::Local::now().date_naive();
-        let path = self
-            .cache
-            .current_raw_path(self.source(), station_id, today, "json");
-        if path.exists() && !refresh {
-            let byte_count = fs::metadata(&path)?.len() as usize;
-            info!(path = %path.display(), byte_count, "reusing cached current raw file");
-            return Ok(CurrentFetchResult {
-                path: path.display().to_string(),
-                byte_count,
-                reused: true,
-            });
-        }
-
         let url = Self::latest_url(station_id);
         let body = self
             .http
@@ -372,6 +364,31 @@ impl WeatherSourceAdapter for NwsApiAdapter {
             .text()
             .await
             .context("failed to read NWS latest observation body")?;
+        let payload: Value =
+            serde_json::from_str(&body).context("failed to parse NWS latest observation JSON")?;
+        let observed_at = payload["properties"]["timestamp"]
+            .as_str()
+            .context("NWS latest observation payload missing properties.timestamp")?;
+        let observed_at = DateTime::parse_from_rfc3339(observed_at)
+            .context("failed to parse NWS latest observation timestamp")?
+            .with_timezone(&Utc);
+        let today = observed_at.date_naive();
+        let path = self.cache.current_raw_path(
+            self.source(),
+            station_id,
+            today,
+            &format!("obs-{}", observed_at.format("%Y%m%dT%H%M%SZ")),
+            "json",
+        );
+        if path.exists() && !refresh {
+            let byte_count = fs::metadata(&path)?.len() as usize;
+            info!(path = %path.display(), byte_count, "reusing cached current raw file");
+            return Ok(CurrentFetchResult {
+                path: path.display().to_string(),
+                byte_count,
+                reused: true,
+            });
+        }
         write_text(&path, &body)?;
         Ok(CurrentFetchResult {
             path: path.display().to_string(),
@@ -430,6 +447,289 @@ impl WeatherSourceAdapter for NwsApiAdapter {
         }
         debug!(station = %station.station_id, path = %path.display(), "normalized NWS latest observation");
         Ok(vec![observation])
+    }
+}
+
+pub struct NceiAsosFiveMinuteAdapter {
+    cache: CacheLayout,
+    http: Client,
+}
+
+impl NceiAsosFiveMinuteAdapter {
+    pub fn new(cache: CacheLayout, http: Client) -> Self {
+        Self { cache, http }
+    }
+
+    fn request_url(station_id: &StationId, year: i32, month: u32) -> String {
+        format!(
+            "https://www.ncei.noaa.gov/data/automated-surface-observing-system-five-minute/access/{year}/{month:02}/asos-5min-{station}-{year}{month:02}.dat",
+            station = station_id.as_nws_id(),
+        )
+    }
+}
+
+#[async_trait]
+impl WeatherSourceAdapter for NceiAsosFiveMinuteAdapter {
+    fn source(&self) -> DataSource {
+        DataSource::NceiAsosFiveMinute
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_station_metadata(&self, station_id: &StationId) -> Result<StationRecord> {
+        let nws = NwsApiAdapter::new(self.cache.clone(), self.http.clone());
+        nws.fetch_station_metadata(station_id).await
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_historical(
+        &self,
+        station_id: &StationId,
+        start: NaiveDate,
+        end: NaiveDate,
+        refresh: bool,
+    ) -> Result<HistoricalFetchResult> {
+        let path = self
+            .cache
+            .historical_raw_path(self.source(), station_id, start, end, "dat");
+        if path.exists() && !refresh {
+            let byte_count = fs::metadata(&path)?.len() as usize;
+            return Ok(HistoricalFetchResult {
+                path: path.display().to_string(),
+                byte_count,
+                reused: true,
+            });
+        }
+
+        let mut bodies = Vec::new();
+        for (year, month) in month_span(start, end) {
+            let url = Self::request_url(station_id, year, month);
+            info!(station = %station_id, %url, "downloading NCEI ASOS 5-minute source month");
+            let body = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("failed to request NCEI 5-minute data {url}"))?
+                .error_for_status()
+                .with_context(|| format!("NCEI 5-minute request failed {url}"))?
+                .text()
+                .await
+                .context("failed to read NCEI 5-minute response body")?;
+            bodies.push(body);
+        }
+        let body = bodies.join("\n");
+        write_text(&path, &body)?;
+        write_json(
+            &self
+                .cache
+                .fetch_manifest_path(self.source(), station_id, start, Some(end)),
+            &SourceMetadata {
+                source: self.source(),
+                schema_version: SCHEMA_VERSION.to_owned(),
+                generated_at_utc: Utc::now(),
+                raw_path: path.display().to_string(),
+            },
+        )?;
+        Ok(HistoricalFetchResult {
+            path: path.display().to_string(),
+            byte_count: body.len(),
+            reused: false,
+        })
+    }
+
+    async fn fetch_current(
+        &self,
+        _station_id: &StationId,
+        _refresh: bool,
+    ) -> Result<CurrentFetchResult> {
+        bail!("ncei-asos-5min does not provide current observation fetch in wxmatch");
+    }
+
+    fn normalize_raw_file(
+        &self,
+        path: &Path,
+        station: &StationRecord,
+    ) -> Result<Vec<ObservationRecord>> {
+        let timezone: Tz = station
+            .timezone
+            .parse()
+            .with_context(|| format!("unsupported timezone {}", station.timezone))?;
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut observations = Vec::new();
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            if let Some(observation) = parse_ncei_line(line, station, timezone, path)? {
+                observations.push(observation);
+            }
+        }
+        Ok(observations)
+    }
+}
+
+pub struct GhcnhAdapter {
+    cache: CacheLayout,
+    http: Client,
+}
+
+impl GhcnhAdapter {
+    pub fn new(cache: CacheLayout, http: Client) -> Self {
+        Self { cache, http }
+    }
+
+    fn station_list_path(&self) -> std::path::PathBuf {
+        self.cache
+            .source_root(DataSource::Ghcnh)
+            .join("station-list.csv")
+    }
+
+    async fn ensure_station_list(&self) -> Result<Vec<GhcnhStationListRow>> {
+        let path = self.station_list_path();
+        if !path.exists() {
+            let url = "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/doc/ghcnh-station-list.csv";
+            let body = self
+                .http
+                .get(url)
+                .send()
+                .await
+                .context("failed to request GHCNh station list")?
+                .error_for_status()
+                .context("GHCNh station list request failed")?
+                .text()
+                .await
+                .context("failed to read GHCNh station list body")?;
+            write_text(&path, &body)?;
+        }
+        let mut reader = ReaderBuilder::new()
+            .from_path(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut rows = Vec::new();
+        for row in reader.deserialize() {
+            rows.push(row.context("failed to parse GHCNh station list row")?);
+        }
+        Ok(rows)
+    }
+
+    async fn ghcnh_station_id(&self, station_id: &StationId) -> Result<String> {
+        let rows = self.ensure_station_list().await?;
+        let station = rows
+            .into_iter()
+            .find(|row| row.icao.as_deref() == Some(station_id.as_nws_id()))
+            .with_context(|| format!("no GHCNh station mapping found for {station_id}"))?;
+        Ok(station.ghcn_id)
+    }
+
+    fn year_url(ghcnh_station_id: &str, year: i32) -> String {
+        format!(
+            "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access/by-year/{year}/psv/GHCNh_{ghcnh_station_id}_{year}.psv"
+        )
+    }
+}
+
+#[async_trait]
+impl WeatherSourceAdapter for GhcnhAdapter {
+    fn source(&self) -> DataSource {
+        DataSource::Ghcnh
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_station_metadata(&self, station_id: &StationId) -> Result<StationRecord> {
+        let nws = NwsApiAdapter::new(self.cache.clone(), self.http.clone());
+        nws.fetch_station_metadata(station_id).await
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_historical(
+        &self,
+        station_id: &StationId,
+        start: NaiveDate,
+        end: NaiveDate,
+        refresh: bool,
+    ) -> Result<HistoricalFetchResult> {
+        let path = self
+            .cache
+            .historical_raw_path(self.source(), station_id, start, end, "psv");
+        if path.exists() && !refresh {
+            let byte_count = fs::metadata(&path)?.len() as usize;
+            return Ok(HistoricalFetchResult {
+                path: path.display().to_string(),
+                byte_count,
+                reused: true,
+            });
+        }
+
+        let ghcnh_station_id = self.ghcnh_station_id(station_id).await?;
+        let mut bodies = Vec::new();
+        for year in start.year()..=end.year() {
+            let url = Self::year_url(&ghcnh_station_id, year);
+            info!(station = %station_id, source_station_id = %ghcnh_station_id, %url, "downloading GHCNh source year");
+            let body = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .with_context(|| format!("failed to request GHCNh data {url}"))?
+                .error_for_status()
+                .with_context(|| format!("GHCNh request failed {url}"))?
+                .text()
+                .await
+                .context("failed to read GHCNh response body")?;
+            bodies.push(body);
+        }
+        let body = bodies.join("\n");
+        write_text(&path, &body)?;
+        write_json(
+            &self
+                .cache
+                .fetch_manifest_path(self.source(), station_id, start, Some(end)),
+            &SourceMetadata {
+                source: self.source(),
+                schema_version: SCHEMA_VERSION.to_owned(),
+                generated_at_utc: Utc::now(),
+                raw_path: path.display().to_string(),
+            },
+        )?;
+        Ok(HistoricalFetchResult {
+            path: path.display().to_string(),
+            byte_count: body.len(),
+            reused: false,
+        })
+    }
+
+    async fn fetch_current(
+        &self,
+        _station_id: &StationId,
+        _refresh: bool,
+    ) -> Result<CurrentFetchResult> {
+        bail!("ghcnh does not provide current observation fetch in wxmatch");
+    }
+
+    fn normalize_raw_file(
+        &self,
+        path: &Path,
+        station: &StationRecord,
+    ) -> Result<Vec<ObservationRecord>> {
+        let timezone: Tz = station
+            .timezone
+            .parse()
+            .with_context(|| format!("unsupported timezone {}", station.timezone))?;
+        let mut reader = ReaderBuilder::new()
+            .delimiter(b'|')
+            .flexible(true)
+            .from_path(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let headers = reader
+            .headers()
+            .context("failed to read GHCNh headers")?
+            .clone();
+        let indexes = GhcnhHeaderIndexes::from_headers(&headers)?;
+        let mut observations = Vec::new();
+        for row in reader.records() {
+            let row = row.context("failed to parse GHCNh row")?;
+            if let Some(observation) = indexes.to_observation(&row, station, timezone, path)? {
+                observations.push(observation);
+            }
+        }
+        Ok(observations)
     }
 }
 
@@ -582,11 +882,312 @@ fn parse_optional_f64_field(raw: Option<&str>) -> Result<Option<f64>> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct GhcnhStationListRow {
+    #[serde(rename = "GHCN_ID")]
+    ghcn_id: String,
+    #[serde(rename = "ICAO")]
+    icao: Option<String>,
+}
+
+#[derive(Debug)]
+struct GhcnhHeaderIndexes {
+    station: usize,
+    date: usize,
+    temperature: usize,
+    dewpoint: usize,
+    relative_humidity: usize,
+    station_level_pressure: usize,
+    sea_level_pressure: usize,
+    wind_direction: usize,
+    wind_speed: usize,
+    wind_gust: usize,
+    precipitation: usize,
+    visibility: usize,
+    altimeter: usize,
+    sky_cover_layer_1: usize,
+}
+
+impl GhcnhHeaderIndexes {
+    fn from_headers(headers: &StringRecord) -> Result<Self> {
+        Ok(Self {
+            station: find_header(headers, "STATION")?,
+            date: find_header(headers, "DATE")?,
+            temperature: find_header(headers, "temperature")?,
+            dewpoint: find_header(headers, "dew_point_temperature")?,
+            relative_humidity: find_header(headers, "relative_humidity")?,
+            station_level_pressure: find_header(headers, "station_level_pressure")?,
+            sea_level_pressure: find_header(headers, "sea_level_pressure")?,
+            wind_direction: find_header(headers, "wind_direction")?,
+            wind_speed: find_header(headers, "wind_speed")?,
+            wind_gust: find_header(headers, "wind_gust")?,
+            precipitation: find_header(headers, "precipitation")?,
+            visibility: find_header(headers, "visibility")?,
+            altimeter: find_header(headers, "altimeter")?,
+            sky_cover_layer_1: find_header(headers, "sky_cover_layer_1")?,
+        })
+    }
+
+    fn to_observation(
+        &self,
+        row: &StringRecord,
+        station: &StationRecord,
+        timezone: Tz,
+        path: &Path,
+    ) -> Result<Option<ObservationRecord>> {
+        let observed_utc = row.get(self.date).unwrap_or_default();
+        if observed_utc.is_empty() {
+            return Ok(None);
+        }
+        let observed_utc = if let Ok(value) = DateTime::parse_from_rfc3339(observed_utc) {
+            value.with_timezone(&Utc)
+        } else {
+            let naive = chrono::NaiveDateTime::parse_from_str(observed_utc, "%Y-%m-%dT%H:%M:%S")
+                .with_context(|| format!("failed to parse GHCNh timestamp {observed_utc}"))?;
+            Utc.from_utc_datetime(&naive)
+        };
+        let observed_local = observed_utc.with_timezone(&timezone).fixed_offset();
+        let mut observation = ObservationRecord::from_parts(
+            station.station_id.clone(),
+            DataSource::Ghcnh,
+            row.get(self.station).unwrap_or_default().to_owned(),
+            observed_local,
+            path.display().to_string(),
+        );
+        observation.temperature_c = parse_optional_f64_field(row.get(self.temperature))?;
+        observation.dewpoint_c = parse_optional_f64_field(row.get(self.dewpoint))?;
+        observation.relative_humidity_pct =
+            parse_optional_f64_field(row.get(self.relative_humidity))?;
+        observation.wind_direction_deg = parse_optional_f64_field(row.get(self.wind_direction))?;
+        observation.wind_speed_kt = parse_optional_f64_field(row.get(self.wind_speed))?;
+        observation.wind_gust_kt = parse_optional_f64_field(row.get(self.wind_gust))?;
+        observation.precipitation_mm = parse_optional_f64_field(row.get(self.precipitation))?;
+        observation.pressure_hpa = parse_optional_f64_field(row.get(self.station_level_pressure))?;
+        observation.sea_level_pressure_hpa =
+            parse_optional_f64_field(row.get(self.sea_level_pressure))?;
+        observation.visibility_km = parse_optional_f64_field(row.get(self.visibility))?;
+        if observation.pressure_hpa.is_none() {
+            observation.pressure_hpa = parse_optional_f64_field(row.get(self.altimeter))?;
+        }
+        observation.cloud_cover_code = row
+            .get(self.sky_cover_layer_1)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        observation.cloud_cover_fraction = observation
+            .cloud_cover_code
+            .as_deref()
+            .and_then(cloud_fraction_from_code);
+        if let (Some(direction), Some(speed)) =
+            (observation.wind_direction_deg, observation.wind_speed_kt)
+        {
+            let (u, v) = wind_components_knots(direction, speed);
+            observation.wind_u_kt = Some(u);
+            observation.wind_v_kt = Some(v);
+        }
+        if observation.relative_humidity_pct.is_none() {
+            if let (Some(temp_c), Some(dew_c)) = (observation.temperature_c, observation.dewpoint_c)
+            {
+                observation.relative_humidity_pct =
+                    Some(relative_humidity_from_celsius(temp_c, dew_c));
+                observation
+                    .quality_flags
+                    .push(QualityFlag::DerivedRelativeHumidity);
+            }
+        }
+        Ok(Some(observation))
+    }
+}
+
+fn month_span(start: NaiveDate, end: NaiveDate) -> Vec<(i32, u32)> {
+    let mut year = start.year();
+    let mut month = start.month();
+    let mut months = Vec::new();
+    loop {
+        months.push((year, month));
+        if year == end.year() && month == end.month() {
+            break;
+        }
+        month += 1;
+        if month == 13 {
+            month = 1;
+            year += 1;
+        }
+    }
+    months
+}
+
+fn parse_ncei_line(
+    line: &str,
+    station: &StationRecord,
+    timezone: Tz,
+    path: &Path,
+) -> Result<Option<ObservationRecord>> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 10 {
+        return Ok(None);
+    }
+
+    let local_stamp = parts
+        .get(1)
+        .copied()
+        .context("NCEI line missing local timestamp token")?;
+    let station_prefix_len = station.station_id.as_iem_id().len();
+    if local_stamp.len() < station_prefix_len + 12 {
+        return Ok(None);
+    }
+    let local_stamp = &local_stamp[station_prefix_len..station_prefix_len + 12];
+    let observed_local_naive = chrono::NaiveDateTime::parse_from_str(local_stamp, "%Y%m%d%H%M")
+        .with_context(|| format!("failed to parse NCEI local timestamp {local_stamp}"))?;
+    let observed_local = timezone
+        .from_local_datetime(&observed_local_naive)
+        .single()
+        .context("failed to resolve NCEI local timestamp in station timezone")?
+        .fixed_offset();
+
+    let mut observation = ObservationRecord::from_parts(
+        station.station_id.clone(),
+        DataSource::NceiAsosFiveMinute,
+        station.station_id.to_string(),
+        observed_local,
+        path.display().to_string(),
+    );
+
+    for token in &parts {
+        if token.ends_with("KT") {
+            let (direction, speed, gust) = parse_metar_wind_token(token)?;
+            observation.wind_direction_deg = direction;
+            observation.wind_speed_kt = speed;
+            observation.wind_gust_kt = gust;
+            continue;
+        }
+        if token.ends_with("SM") {
+            observation.visibility_km = parse_visibility_token(token);
+            continue;
+        }
+        if token.starts_with('A') && token.len() == 5 {
+            observation.pressure_hpa = parse_altimeter_token(token);
+            continue;
+        }
+        if token.contains('/') && !token.contains(':') && !token.ends_with('Z') {
+            let (temp_c, dew_c) = parse_temp_dew_token(token)?;
+            if observation.temperature_c.is_none() {
+                observation.temperature_c = temp_c;
+                observation.dewpoint_c = dew_c;
+            }
+            continue;
+        }
+        if observation.cloud_cover_code.is_none() {
+            let cloud_code = token
+                .get(0..3)
+                .filter(|_| cloud_fraction_from_code(token).is_some())
+                .or_else(|| {
+                    token
+                        .get(0..3)
+                        .filter(|code| cloud_fraction_from_code(code).is_some())
+                });
+            if let Some(code) = cloud_code {
+                observation.cloud_cover_code = Some(code.to_owned());
+                observation.cloud_cover_fraction = cloud_fraction_from_code(code);
+            }
+        }
+    }
+
+    if observation.relative_humidity_pct.is_none() {
+        if let (Some(temp_c), Some(dew_c)) = (observation.temperature_c, observation.dewpoint_c) {
+            observation.relative_humidity_pct = Some(relative_humidity_from_celsius(temp_c, dew_c));
+            observation
+                .quality_flags
+                .push(QualityFlag::DerivedRelativeHumidity);
+        }
+    }
+    if let (Some(direction), Some(speed)) =
+        (observation.wind_direction_deg, observation.wind_speed_kt)
+    {
+        let (u, v) = wind_components_knots(direction, speed);
+        observation.wind_u_kt = Some(u);
+        observation.wind_v_kt = Some(v);
+    }
+    Ok(Some(observation))
+}
+
+fn parse_metar_wind_token(token: &str) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
+    let trimmed = token.trim_end_matches("KT");
+    if trimmed == "/////" || trimmed.len() < 5 {
+        return Ok((None, None, None));
+    }
+    let (direction, rest) = if let Some(rest) = trimmed.strip_prefix("VRB") {
+        (None, rest)
+    } else {
+        let direction = trimmed
+            .get(0..3)
+            .context("wind token missing direction")?
+            .parse::<f64>()
+            .ok();
+        (direction, &trimmed[3..])
+    };
+    let (speed_str, gust_str) = if let Some((speed, gust)) = rest.split_once('G') {
+        (speed, Some(gust))
+    } else {
+        (rest, None)
+    };
+    let speed = speed_str.parse::<f64>().ok();
+    let gust = gust_str.and_then(|gust| gust.parse::<f64>().ok());
+    Ok((direction, speed, gust))
+}
+
+fn parse_visibility_token(token: &str) -> Option<f64> {
+    let trimmed = token.trim_end_matches("SM");
+    if let Some((whole, frac)) = trimmed.split_once(' ') {
+        return Some((parse_miles_number(whole)? + parse_miles_number(frac)?) * 1.60934);
+    }
+    parse_miles_number(trimmed).map(|miles| miles * 1.60934)
+}
+
+fn parse_miles_number(token: &str) -> Option<f64> {
+    if let Some((num, den)) = token.split_once('/') {
+        return Some(num.parse::<f64>().ok()? / den.parse::<f64>().ok()?);
+    }
+    token.parse::<f64>().ok()
+}
+
+fn parse_altimeter_token(token: &str) -> Option<f64> {
+    let value = token.strip_prefix('A')?.parse::<f64>().ok()?;
+    Some(inches_hg_to_hpa(value / 100.0))
+}
+
+fn parse_temp_dew_token(token: &str) -> Result<(Option<f64>, Option<f64>)> {
+    let (temp, dew) = token
+        .split_once('/')
+        .with_context(|| format!("invalid temp/dew token {token}"))?;
+    Ok((
+        parse_signed_metar_number(temp),
+        parse_signed_metar_number(dew),
+    ))
+}
+
+fn parse_signed_metar_number(token: &str) -> Option<f64> {
+    let token = token.trim();
+    if token.is_empty() || token == "MM" || token == "M" {
+        return None;
+    }
+    if let Some(value) = token.strip_prefix('M') {
+        return value.parse::<f64>().ok().map(|value| -value);
+    }
+    token.parse::<f64>().ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use chrono::{Timelike, Utc};
+    use chrono_tz::America::Chicago;
     use serde::Deserialize;
 
-    use super::parse_optional_f64_field;
+    use crate::domain::{StationId, StationRecord};
+
+    use super::{parse_ncei_line, parse_optional_f64_field};
 
     #[derive(Deserialize)]
     struct Probe {
@@ -615,5 +1216,31 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn parses_ncei_five_minute_line() {
+        let station = StationRecord {
+            station_id: StationId::new("KDSM"),
+            source_station_id: "KDSM".to_owned(),
+            name: "Des Moines".to_owned(),
+            timezone: "America/Chicago".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            elevation_m: None,
+            provider: None,
+            fetched_at_utc: Utc::now(),
+        };
+        let line = "14933KDSM DSM20260501000010105/01/26 00:00:31  5-MIN KDSM 010600Z 24003KT 10SM CLR 06/M02 A3007 820 57 0 230/03 RMK AO2 T00611017";
+        let observation = parse_ncei_line(line, &station, Chicago, Path::new("/tmp/ncei.dat"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.station_id.to_string(), "KDSM");
+        assert_eq!(observation.observed_at_local.hour(), 0);
+        assert_eq!(observation.temperature_c, Some(6.0));
+        assert_eq!(observation.dewpoint_c, Some(-2.0));
+        assert_eq!(observation.wind_speed_kt, Some(3.0));
+        assert_eq!(observation.wind_direction_deg, Some(240.0));
+        assert_eq!(observation.cloud_cover_code.as_deref(), Some("CLR"));
     }
 }

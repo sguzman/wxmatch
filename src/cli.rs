@@ -28,6 +28,9 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
     pub verbose: u8,
 
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text, env = "WXMATCH_FORMAT")]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -36,6 +39,12 @@ pub struct Cli {
 pub enum LogFormat {
     Pretty,
     Compact,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum OutputFormat {
+    Text,
     Json,
 }
 

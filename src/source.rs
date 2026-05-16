@@ -19,6 +19,16 @@ pub struct SourceDescriptor {
 }
 
 impl DataSource {
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value {
+            "iem-asos-1min" => Some(Self::IemAsosOneMinute),
+            "ncei-asos-5min" => Some(Self::NceiAsosFiveMinute),
+            "nws-api" => Some(Self::NwsApi),
+            "ghcnh" => Some(Self::Ghcnh),
+            _ => None,
+        }
+    }
+
     pub fn slug(self) -> &'static str {
         match self {
             Self::IemAsosOneMinute => "iem-asos-1min",

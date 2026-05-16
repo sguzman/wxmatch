@@ -2,19 +2,21 @@
 
 ## Summary
 
-`wxmatch` is a station-level weather cache and query CLI built around reproducible downloads, normalized observations, derived daily/profile datasets, and analog-day analysis.
+`wxmatch` is a station-level weather cache and query CLI built around reproducible downloads, canonical weather observations, derived daily/profile datasets, and analog-day analysis.
 
-This document is the working implementation spec for the current bootstrap and the next major product phases.
+This document is the working implementation spec for the current repository state and the remaining roadmap work.
 
 ## Current State
 
-- The crate builds and tests.
-- CLI shape is stable.
-- `IEM ASOS 1-minute` historical fetch is implemented.
-- `NWS API` station metadata and current/latest fetch are implemented.
-- Normalized observations are written as JSON arrays.
-- Daily summaries and hourly day profiles are implemented.
-- Probability and analog queries are implemented at a practical v1 level.
+- The crate builds, formats, and tests.
+- CLI shape is stable around `cache`, `source`, `station`, `fetch`, `normalize`, `build`, and `query`.
+- `IEM ASOS 1-minute` historical fetch and normalization are implemented.
+- `NOAA/NCEI ASOS 5-minute` historical fetch and normalization are implemented.
+- `NWS API` station metadata and current/latest fetch are implemented, with repeated snapshots preserved by timestamp.
+- `GHCNh` historical fetch and normalization are implemented.
+- Normalized observations are written as Parquet datasets keyed by station and year.
+- Daily summaries and hourly day profiles are written as Parquet datasets keyed by station and year.
+- Query commands support text and JSON output.
 
 ## Canonical Data Model
 
@@ -48,16 +50,20 @@ Derived datasets:
 - `ProbabilityBreakdown`
 - `AnalogResult`
 
-## Source Order
+## Source Precedence
 
-1. `IEM ASOS 1-minute`
-2. `NWS API`
-3. `NOAA/NCEI ASOS 5-minute`
+When multiple normalized observations exist for the same station and UTC timestamp, `wxmatch` keeps one canonical record using this priority order:
+
+1. `NOAA/NCEI ASOS 5-minute`
+2. `IEM ASOS 1-minute`
+3. `NWS API`
 4. `GHCNh`
+
+This prevents overlapping source windows from double-counting the same moment in time.
 
 ## Source Adapter Interface
 
-Each adapter should support:
+Each adapter supports:
 
 - station metadata fetch
 - historical fetch when applicable
@@ -83,57 +89,68 @@ Stable layout:
 
 ```text
 sources/<source>/raw/...
-sources/<source>/normalized/...
-stations/...
-derived/...
-manifests/...
+sources/<source>/normalized/station=<id>/year=<yyyy>.parquet
+stations/<station>.json
+derived/station=<id>/daily/year=<yyyy>.parquet
+derived/station=<id>/profiles/year=<yyyy>.parquet
+manifests/*.json
 logs/...
 ```
 
 Rules:
 
-- raw files are immutable
-- normalized files are rebuildable
-- derived files are keyed by station and year
-- manifests record source, schema version, generation time, and raw path
+- raw files are immutable and source-specific
+- normalized Parquet files are rebuildable from raw
+- derived Parquet files are rebuildable from normalized data
+- manifests remain JSON and record source, schema version, generation time, and raw path
+- rebuild-from-raw is the preferred migration path from legacy JSON normalized/derived artifacts
+- dataset paths are intentionally DuckDB-friendly
 
-## Implemented v1 Behavior
+## Implemented Runtime Behavior
 
 ### Historical path
 
-1. Fetch raw minute-level CSV from IEM.
-2. Cache raw CSV by station and date window.
-3. Normalize into canonical observation records.
-4. Build daily summaries and day profiles by year.
+1. Fetch raw archive artifacts from one or more historical providers.
+2. Cache raw artifacts by station and date window.
+3. Normalize raw rows into canonical observations.
+4. Group normalized observations into yearly Parquet datasets.
+5. Build yearly daily summaries and day profiles.
 
 ### Current-day path
 
 1. Fetch station metadata from NWS.
 2. Fetch latest observation from NWS.
-3. Normalize and cache that observation.
-4. Use it for `today`-style queries when possible.
+3. Preserve each raw observation snapshot by timestamp.
+4. Normalize and merge into yearly Parquet datasets.
+5. Use that partial-day data for `today`-style queries.
 
 ### Query methods
 
-- `query day`: prints daily summary and profile availability
+- `query day`: daily summary and observed-hour coverage
 - `query prob`: seasonal climatology plus analog-based estimate when enough profile data exists
 - `query analogs`: same-station nearest-neighbor analog search over hourly profiles
+- `source list` and `station inspect`: cache/source coverage inspection in text or JSON
 
 ## Validation Rules
 
 - end date must not be earlier than start date
 - station ids are normalized to uppercase ICAO-like identifiers
-- IEM historical requests use the 3-letter stripped form when appropriate
+- IEM historical requests use station-local day semantics
 - local timestamps are derived from cached NWS station timezone metadata
+- overlapping timestamps are resolved by explicit source precedence
 - wind similarity uses vector components, not direct direction deltas
 - cloud cover fractions are derived from METAR layer codes when available
 
 ## Acceptance Criteria
 
-The bootstrap is considered successful when all of the following work:
+The current bootstrap is considered successful when all of the following work:
 
 - `fetch station ... --source iem-asos-one-minute`
+- `fetch station ... --source ncei-asos-five-minute`
+- `fetch station ... --source ghcnh`
 - `normalize station ... --source iem-asos-one-minute`
+- `normalize station ... --source ncei-asos-five-minute`
+- `normalize station ... --source ghcnh`
 - `build daily ...`
 - `build profiles ...`
 - `query day ...`
@@ -146,24 +163,13 @@ And:
 - `cargo check` passes
 - `cargo test` passes
 - structured logs are emitted
-- cache artifacts are written to the documented layout
+- normalized and derived cache artifacts are written as Parquet
+- cache artifacts are directly queryable from DuckDB
 
-## Next Phases
+## Remaining Work
 
-### Phase 2
-
-- add `NOAA/NCEI ASOS 5-minute`
-- add richer provenance and overlap handling
-- improve manifests and source precedence
-
-### Phase 3
-
-- add `GHCNh`
-- expand cross-station and broader geography support
-
-### Phase 4
-
-- richer partial-day modeling
-- more live observations per day
-- JSON output mode
-- more probability methods and calibration
+- improve manifests and provenance visibility around overlap and refresh state
+- extend probability methods beyond climatology plus analog neighbors
+- improve current-day modeling quality with denser same-day live snapshots
+- increase precip/cloud-layer coverage where upstream archives expose richer detail
+- add optional ergonomics around migration and DuckDB inspection helpers

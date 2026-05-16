@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +171,70 @@ pub struct AnalogResult {
     pub compared_hours: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservationRow {
+    pub schema_version: String,
+    pub station_id: String,
+    pub source: String,
+    pub source_station_id: String,
+    pub observed_at_utc: String,
+    pub observed_at_local: String,
+    pub local_date: String,
+    pub minute_of_day: u16,
+    pub temperature_c: Option<f64>,
+    pub dewpoint_c: Option<f64>,
+    pub relative_humidity_pct: Option<f64>,
+    pub wind_speed_kt: Option<f64>,
+    pub wind_gust_kt: Option<f64>,
+    pub wind_direction_deg: Option<f64>,
+    pub wind_u_kt: Option<f64>,
+    pub wind_v_kt: Option<f64>,
+    pub precipitation_mm: Option<f64>,
+    pub pressure_hpa: Option<f64>,
+    pub sea_level_pressure_hpa: Option<f64>,
+    pub visibility_km: Option<f64>,
+    pub cloud_cover_code: Option<String>,
+    pub cloud_cover_fraction: Option<f64>,
+    pub raw_ref: String,
+    pub text_description: Option<String>,
+    pub quality_flags_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySummaryRow {
+    pub schema_version: String,
+    pub station_id: String,
+    pub local_date: String,
+    pub observation_count: u64,
+    pub high_temp_c: Option<f64>,
+    pub low_temp_c: Option<f64>,
+    pub mean_temp_c: Option<f64>,
+    pub mean_dewpoint_c: Option<f64>,
+    pub mean_relative_humidity_pct: Option<f64>,
+    pub max_wind_speed_kt: Option<f64>,
+    pub mean_wind_u_kt: Option<f64>,
+    pub mean_wind_v_kt: Option<f64>,
+    pub total_precipitation_mm: Option<f64>,
+    pub mean_cloud_cover_fraction: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DayProfileRow {
+    pub schema_version: String,
+    pub station_id: String,
+    pub local_date: String,
+    pub observed_hour_count: u64,
+    pub hour: u8,
+    pub sample_count: u64,
+    pub temperature_c: Option<f64>,
+    pub dewpoint_c: Option<f64>,
+    pub relative_humidity_pct: Option<f64>,
+    pub wind_u_kt: Option<f64>,
+    pub wind_v_kt: Option<f64>,
+    pub cloud_cover_fraction: Option<f64>,
+    pub precipitation_mm: Option<f64>,
+}
+
 impl ObservationRecord {
     pub fn from_parts(
         station_id: StationId,
@@ -207,6 +273,177 @@ impl ObservationRecord {
             text_description: None,
             quality_flags: Vec::new(),
         }
+    }
+}
+
+impl ObservationRow {
+    pub fn from_observation(value: &ObservationRecord) -> Result<Self> {
+        Ok(Self {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            station_id: value.station_id.to_string(),
+            source: value.source.slug().to_owned(),
+            source_station_id: value.source_station_id.clone(),
+            observed_at_utc: value.observed_at_utc.to_rfc3339(),
+            observed_at_local: value.observed_at_local.to_rfc3339(),
+            local_date: value.local_date.format("%Y-%m-%d").to_string(),
+            minute_of_day: value.minute_of_day,
+            temperature_c: value.temperature_c,
+            dewpoint_c: value.dewpoint_c,
+            relative_humidity_pct: value.relative_humidity_pct,
+            wind_speed_kt: value.wind_speed_kt,
+            wind_gust_kt: value.wind_gust_kt,
+            wind_direction_deg: value.wind_direction_deg,
+            wind_u_kt: value.wind_u_kt,
+            wind_v_kt: value.wind_v_kt,
+            precipitation_mm: value.precipitation_mm,
+            pressure_hpa: value.pressure_hpa,
+            sea_level_pressure_hpa: value.sea_level_pressure_hpa,
+            visibility_km: value.visibility_km,
+            cloud_cover_code: value.cloud_cover_code.clone(),
+            cloud_cover_fraction: value.cloud_cover_fraction,
+            raw_ref: value.raw_ref.clone(),
+            text_description: value.text_description.clone(),
+            quality_flags_json: serde_json::to_string(&value.quality_flags)
+                .context("failed to serialize quality flags")?,
+        })
+    }
+
+    pub fn into_observation(self) -> Result<ObservationRecord> {
+        Ok(ObservationRecord {
+            station_id: StationId::new(&self.station_id),
+            source: DataSource::from_slug(&self.source)
+                .context("failed to parse observation source")?,
+            source_station_id: self.source_station_id,
+            observed_at_utc: DateTime::parse_from_rfc3339(&self.observed_at_utc)
+                .context("failed to parse observed_at_utc")?
+                .with_timezone(&Utc),
+            observed_at_local: DateTime::parse_from_rfc3339(&self.observed_at_local)
+                .context("failed to parse observed_at_local")?,
+            local_date: NaiveDate::parse_from_str(&self.local_date, "%Y-%m-%d")
+                .context("failed to parse local_date")?,
+            minute_of_day: self.minute_of_day,
+            temperature_c: self.temperature_c,
+            dewpoint_c: self.dewpoint_c,
+            relative_humidity_pct: self.relative_humidity_pct,
+            wind_speed_kt: self.wind_speed_kt,
+            wind_gust_kt: self.wind_gust_kt,
+            wind_direction_deg: self.wind_direction_deg,
+            wind_u_kt: self.wind_u_kt,
+            wind_v_kt: self.wind_v_kt,
+            precipitation_mm: self.precipitation_mm,
+            pressure_hpa: self.pressure_hpa,
+            sea_level_pressure_hpa: self.sea_level_pressure_hpa,
+            visibility_km: self.visibility_km,
+            cloud_cover_code: self.cloud_cover_code,
+            cloud_cover_fraction: self.cloud_cover_fraction,
+            raw_ref: self.raw_ref,
+            text_description: self.text_description,
+            quality_flags: serde_json::from_str(&self.quality_flags_json)
+                .context("failed to parse quality flags")?,
+        })
+    }
+}
+
+impl DailySummaryRow {
+    pub fn from_summary(value: &DailySummary) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            station_id: value.station_id.to_string(),
+            local_date: value.local_date.format("%Y-%m-%d").to_string(),
+            observation_count: value.observation_count as u64,
+            high_temp_c: value.high_temp_c,
+            low_temp_c: value.low_temp_c,
+            mean_temp_c: value.mean_temp_c,
+            mean_dewpoint_c: value.mean_dewpoint_c,
+            mean_relative_humidity_pct: value.mean_relative_humidity_pct,
+            max_wind_speed_kt: value.max_wind_speed_kt,
+            mean_wind_u_kt: value.mean_wind_u_kt,
+            mean_wind_v_kt: value.mean_wind_v_kt,
+            total_precipitation_mm: value.total_precipitation_mm,
+            mean_cloud_cover_fraction: value.mean_cloud_cover_fraction,
+        }
+    }
+
+    pub fn into_summary(self) -> Result<DailySummary> {
+        Ok(DailySummary {
+            station_id: StationId::new(&self.station_id),
+            local_date: NaiveDate::parse_from_str(&self.local_date, "%Y-%m-%d")
+                .context("failed to parse summary local_date")?,
+            observation_count: self.observation_count as usize,
+            high_temp_c: self.high_temp_c,
+            low_temp_c: self.low_temp_c,
+            mean_temp_c: self.mean_temp_c,
+            mean_dewpoint_c: self.mean_dewpoint_c,
+            mean_relative_humidity_pct: self.mean_relative_humidity_pct,
+            max_wind_speed_kt: self.max_wind_speed_kt,
+            mean_wind_u_kt: self.mean_wind_u_kt,
+            mean_wind_v_kt: self.mean_wind_v_kt,
+            total_precipitation_mm: self.total_precipitation_mm,
+            mean_cloud_cover_fraction: self.mean_cloud_cover_fraction,
+        })
+    }
+}
+
+impl DayProfileRow {
+    pub fn from_profile(value: &DayProfile) -> Vec<Self> {
+        value
+            .hours
+            .iter()
+            .map(|hour| Self {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                station_id: value.station_id.to_string(),
+                local_date: value.local_date.format("%Y-%m-%d").to_string(),
+                observed_hour_count: value.observed_hour_count as u64,
+                hour: hour.hour,
+                sample_count: hour.sample_count as u64,
+                temperature_c: hour.temperature_c,
+                dewpoint_c: hour.dewpoint_c,
+                relative_humidity_pct: hour.relative_humidity_pct,
+                wind_u_kt: hour.wind_u_kt,
+                wind_v_kt: hour.wind_v_kt,
+                cloud_cover_fraction: hour.cloud_cover_fraction,
+                precipitation_mm: hour.precipitation_mm,
+            })
+            .collect()
+    }
+
+    pub fn into_profiles(rows: Vec<Self>) -> Result<Vec<DayProfile>> {
+        let mut grouped: BTreeMap<(String, String), Vec<Self>> = BTreeMap::new();
+        for row in rows {
+            grouped
+                .entry((row.station_id.clone(), row.local_date.clone()))
+                .or_default()
+                .push(row);
+        }
+
+        let mut profiles = Vec::new();
+        for ((station_id, local_date), mut rows) in grouped {
+            rows.sort_by_key(|row| row.hour);
+            let observed_hour_count = rows.first().map(|row| row.observed_hour_count).unwrap_or(0);
+            let hours = rows
+                .into_iter()
+                .map(|row| HourlyProfilePoint {
+                    hour: row.hour,
+                    sample_count: row.sample_count as usize,
+                    temperature_c: row.temperature_c,
+                    dewpoint_c: row.dewpoint_c,
+                    relative_humidity_pct: row.relative_humidity_pct,
+                    wind_u_kt: row.wind_u_kt,
+                    wind_v_kt: row.wind_v_kt,
+                    cloud_cover_fraction: row.cloud_cover_fraction,
+                    precipitation_mm: row.precipitation_mm,
+                })
+                .collect();
+            profiles.push(DayProfile {
+                station_id: StationId::new(&station_id),
+                local_date: NaiveDate::parse_from_str(&local_date, "%Y-%m-%d")
+                    .context("failed to parse profile local_date")?,
+                observed_hour_count: observed_hour_count as usize,
+                hours,
+            });
+        }
+
+        Ok(profiles)
     }
 }
 

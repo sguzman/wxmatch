@@ -3,6 +3,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
+use serde::Serialize;
+use serde_json::json;
 use tracing::{debug, info, instrument};
 
 use crate::app::App;
@@ -10,28 +12,40 @@ use crate::cache::CacheLayout;
 use crate::cli::{
     AnalogsArgs, BuildCommand, BuildSubcommand, CacheCommand, CacheSubcommand, Cli, Command,
     FetchCommand, FetchCurrentArgs, FetchStationArgs, NormalizeCommand, NormalizeSubcommand,
-    ProbabilityArgs, QueryCommand, QuerySubcommand, SourceCommand, SourceSubcommand,
+    OutputFormat, ProbabilityArgs, QueryCommand, QuerySubcommand, SourceCommand, SourceSubcommand,
     StationCommand, StationSubcommand,
 };
-use crate::domain::{ObservationRecord, StationId, celsius_to_fahrenheit};
+use crate::domain::{
+    DailySummary, DailySummaryRow, DayProfile, DayProfileRow, ObservationRecord, ObservationRow,
+    StationId, celsius_to_fahrenheit,
+};
 use crate::engine::{
     DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder, build_probability_breakdown,
     dedupe_observations, target_date_or_today, top_analogs,
 };
 use crate::source::{DataSource, SourceDescriptor, all_sources};
 use crate::sources::WeatherSourceAdapter;
-use crate::storage::{list_files_recursive, read_json, write_json};
+use crate::storage::{list_files_recursive, read_parquet, write_parquet};
 
 pub async fn dispatch(app: &App, cli: Cli) -> Result<()> {
+    let format = cli.format;
     match cli.command {
         Command::Cache(command) => handle_cache(app, command).await,
-        Command::Source(command) => handle_source(command).await,
-        Command::Station(command) => handle_station(app, command).await,
+        Command::Source(command) => handle_source(format, app, command).await,
+        Command::Station(command) => handle_station(format, app, command).await,
         Command::Fetch(command) => handle_fetch(app, command).await,
         Command::Normalize(command) => handle_normalize(app, command).await,
         Command::Build(command) => handle_build(app, command).await,
-        Command::Query(command) => handle_query(app, command).await,
+        Command::Query(command) => handle_query(format, app, command).await,
     }
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).context("failed to serialize JSON output")?
+    );
+    Ok(())
 }
 
 #[instrument(skip(app))]
@@ -48,18 +62,43 @@ async fn handle_cache(app: &App, command: CacheCommand) -> Result<()> {
     Ok(())
 }
 
-#[instrument]
-async fn handle_source(command: SourceCommand) -> Result<()> {
+#[instrument(skip(app))]
+async fn handle_source(format: OutputFormat, app: &App, command: SourceCommand) -> Result<()> {
     match command.command {
         SourceSubcommand::List => {
-            for descriptor in all_sources().into_iter().map(SourceDescriptor::from_source) {
-                println!(
-                    "{slug:16}  cadence={cadence:12} scope={scope:18} {summary}",
-                    slug = descriptor.slug,
-                    cadence = descriptor.cadence,
-                    scope = descriptor.scope,
-                    summary = descriptor.summary,
-                );
+            let descriptors = all_sources()
+                .into_iter()
+                .map(SourceDescriptor::from_source)
+                .map(|descriptor| {
+                    let normalized_root = app.cache.source_root(descriptor.source).join("normalized");
+                    let raw_root = app.cache.source_root(descriptor.source).join("raw");
+                    json!({
+                        "source": descriptor.source.slug(),
+                        "slug": descriptor.slug,
+                        "cadence": descriptor.cadence,
+                        "scope": descriptor.scope,
+                        "summary": descriptor.summary,
+                        "raw_files": count_files(&raw_root, source_raw_extension(descriptor.source)).unwrap_or(0),
+                        "normalized_parquet_files": count_files(&normalized_root, "parquet").unwrap_or(0),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if format == OutputFormat::Json {
+                print_json(&descriptors)?;
+            } else {
+                for descriptor in descriptors {
+                    println!(
+                        "{slug:16}  cadence={cadence:12} scope={scope:18} raw={raw_files:4} normalized={normalized_files:4} {summary}",
+                        slug = descriptor["slug"].as_str().unwrap_or_default(),
+                        cadence = descriptor["cadence"].as_str().unwrap_or_default(),
+                        scope = descriptor["scope"].as_str().unwrap_or_default(),
+                        raw_files = descriptor["raw_files"].as_u64().unwrap_or_default(),
+                        normalized_files = descriptor["normalized_parquet_files"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                        summary = descriptor["summary"].as_str().unwrap_or_default(),
+                    );
+                }
             }
         }
     }
@@ -68,7 +107,7 @@ async fn handle_source(command: SourceCommand) -> Result<()> {
 }
 
 #[instrument(skip(app))]
-async fn handle_station(app: &App, command: StationCommand) -> Result<()> {
+async fn handle_station(format: OutputFormat, app: &App, command: StationCommand) -> Result<()> {
     match command.command {
         StationSubcommand::Inspect { station } => {
             let station_id = StationId::new(&station);
@@ -83,52 +122,98 @@ async fn handle_station(app: &App, command: StationCommand) -> Result<()> {
                 &app.cache
                     .source_root(DataSource::IemAsosOneMinute)
                     .join(format!("normalized/station={station_id}")),
-                "json",
+                "parquet",
             )?;
             let normalized_nws = count_files(
                 &app.cache
                     .source_root(DataSource::NwsApi)
                     .join(format!("normalized/station={station_id}")),
-                "json",
+                "parquet",
+            )?;
+            let normalized_ncei = count_files(
+                &app.cache
+                    .source_root(DataSource::NceiAsosFiveMinute)
+                    .join(format!("normalized/station={station_id}")),
+                "parquet",
+            )?;
+            let normalized_ghcnh = count_files(
+                &app.cache
+                    .source_root(DataSource::Ghcnh)
+                    .join(format!("normalized/station={station_id}")),
+                "parquet",
             )?;
             let daily_years = count_files(
                 &app.cache
                     .derived_dir
                     .join(format!("station={station_id}/daily")),
-                "json",
+                "parquet",
             )?;
             let profile_years = count_files(
                 &app.cache
                     .derived_dir
                     .join(format!("station={station_id}/profiles")),
-                "json",
+                "parquet",
             )?;
-            println!("station: {}", station_record.station_id);
-            println!("source station id: {}", station_record.source_station_id);
-            println!("name: {}", station_record.name);
-            println!("timezone: {}", station_record.timezone);
-            println!(
-                "location: {}, {}",
-                station_record.latitude, station_record.longitude
-            );
-            if let Some(elevation) = station_record.elevation_m {
-                println!("elevation_m: {:.1}", elevation);
+            let output = json!({
+                "station": station_record.station_id,
+                "source_station_id": station_record.source_station_id,
+                "name": station_record.name,
+                "timezone": station_record.timezone,
+                "latitude": station_record.latitude,
+                "longitude": station_record.longitude,
+                "elevation_m": station_record.elevation_m,
+                "provider": station_record.provider.unwrap_or_else(|| "unknown".to_owned()),
+                "station_cache": app.cache.station_metadata_path(&station_id).display().to_string(),
+                "cache_status": {
+                    "iem_raw_files": raw_iem,
+                    "iem_normalized_files": normalized_iem,
+                    "nws_normalized_files": normalized_nws,
+                    "ncei_normalized_files": normalized_ncei,
+                    "ghcnh_normalized_files": normalized_ghcnh,
+                    "daily_years_built": daily_years,
+                    "profile_years_built": profile_years,
+                }
+            });
+            if format == OutputFormat::Json {
+                print_json(&output)?;
+            } else {
+                println!(
+                    "station: {}",
+                    output["station"].as_str().unwrap_or_default()
+                );
+                println!(
+                    "source station id: {}",
+                    output["source_station_id"].as_str().unwrap_or_default()
+                );
+                println!("name: {}", output["name"].as_str().unwrap_or_default());
+                println!(
+                    "timezone: {}",
+                    output["timezone"].as_str().unwrap_or_default()
+                );
+                println!(
+                    "location: {}, {}",
+                    output["latitude"].as_f64().unwrap_or_default(),
+                    output["longitude"].as_f64().unwrap_or_default()
+                );
+                if let Some(elevation) = output["elevation_m"].as_f64() {
+                    println!("elevation_m: {:.1}", elevation);
+                }
+                println!(
+                    "provider: {}",
+                    output["provider"].as_str().unwrap_or_default()
+                );
+                println!(
+                    "station cache: {}",
+                    output["station_cache"].as_str().unwrap_or_default()
+                );
+                println!("iem raw files: {raw_iem}");
+                println!("iem normalized files: {normalized_iem}");
+                println!("nws normalized files: {normalized_nws}");
+                println!("ncei normalized files: {normalized_ncei}");
+                println!("ghcnh normalized files: {normalized_ghcnh}");
+                println!("daily years built: {daily_years}");
+                println!("profile years built: {profile_years}");
             }
-            println!(
-                "provider: {}",
-                station_record
-                    .provider
-                    .unwrap_or_else(|| "unknown".to_owned())
-            );
-            println!(
-                "station cache: {}",
-                app.cache.station_metadata_path(&station_id).display()
-            );
-            println!("iem raw files: {raw_iem}");
-            println!("iem normalized files: {normalized_iem}");
-            println!("nws normalized files: {normalized_nws}");
-            println!("daily years built: {daily_years}");
-            println!("profile years built: {profile_years}");
         }
     }
 
@@ -165,16 +250,22 @@ async fn handle_build(app: &App, command: BuildCommand) -> Result<()> {
 }
 
 #[instrument(skip(app))]
-async fn handle_query(app: &App, command: QueryCommand) -> Result<()> {
+async fn handle_query(format: OutputFormat, app: &App, command: QueryCommand) -> Result<()> {
     match command.command {
         QuerySubcommand::Day { station, date } => {
-            query_day(app, &StationId::new(&station), date).await
+            query_day(format, app, &StationId::new(&station), date).await
         }
         QuerySubcommand::Today { station } => {
-            query_day(app, &StationId::new(&station), Local::now().date_naive()).await
+            query_day(
+                format,
+                app,
+                &StationId::new(&station),
+                Local::now().date_naive(),
+            )
+            .await
         }
-        QuerySubcommand::Prob(args) => query_probability(app, args).await,
-        QuerySubcommand::Analogs(args) => query_analogs(app, args).await,
+        QuerySubcommand::Prob(args) => query_probability(format, app, args).await,
+        QuerySubcommand::Analogs(args) => query_analogs(format, app, args).await,
     }
 }
 
@@ -216,18 +307,17 @@ async fn fetch_current(app: &App, args: FetchCurrentArgs) -> Result<()> {
         .sources
         .nws
         .normalize_raw_file(Path::new(&result.path), &station)?;
-    let normalized_path = app.cache.normalized_path(
-        DataSource::NwsApi,
-        &station_id,
-        &format!("current-{}", Local::now().date_naive().format("%Y%m%d")),
-    );
-    write_json(&normalized_path, &normalized)?;
+    let current_year = Local::now().year();
+    let normalized_path = app
+        .cache
+        .normalized_path(DataSource::NwsApi, &station_id, current_year);
+    merge_observations_into_year(&normalized_path, normalized)?;
 
     println!("station: {}", station.station_id);
     println!("source: {}", DataSource::NwsApi.slug());
     println!("raw path: {}", result.path);
     println!("normalized path: {}", normalized_path.display());
-    println!("observations: {}", normalized.len());
+    println!("observations written: 1");
     Ok(())
 }
 
@@ -242,34 +332,45 @@ async fn normalize_station(app: &App, station_id: &StationId, source: DataSource
     let raw_ext = match source {
         DataSource::IemAsosOneMinute => "csv",
         DataSource::NwsApi => "json",
-        DataSource::NceiAsosFiveMinute | DataSource::Ghcnh => {
-            bail!("source {} is not implemented", source.slug())
-        }
+        DataSource::NceiAsosFiveMinute => "dat",
+        DataSource::Ghcnh => "psv",
     };
     let raw_files = list_files_recursive(&raw_root, raw_ext)?;
     if raw_files.is_empty() {
         bail!("no raw files found under {}", raw_root.display());
     }
 
-    let mut normalized_total = 0usize;
+    let mut grouped_by_year: BTreeMap<i32, Vec<ObservationRecord>> = BTreeMap::new();
     for raw_path in raw_files {
         let observations = adapter.normalize_raw_file(&raw_path, &station)?;
-        normalized_total += observations.len();
-        let normalized_name = raw_path
-            .file_stem()
-            .and_then(|v| v.to_str())
-            .unwrap_or("normalized");
-        let normalized_path = app
-            .cache
-            .normalized_path(source, station_id, normalized_name);
-        write_json(&normalized_path, &observations)?;
+        for observation in observations {
+            grouped_by_year
+                .entry(observation.local_date.year())
+                .or_default()
+                .push(observation);
+        }
         info!(
             source = source.slug(),
             station = %station_id,
             raw = %raw_path.display(),
-            normalized = %normalized_path.display(),
-            observations = observations.len(),
+            observations = grouped_by_year.values().map(Vec::len).sum::<usize>(),
             "normalized raw file"
+        );
+    }
+
+    let mut normalized_total = 0usize;
+    let years = collect_years(&grouped_by_year, None)?;
+    for year in years {
+        let normalized_path = app.cache.normalized_path(source, station_id, year);
+        let observations = grouped_by_year.remove(&year).unwrap_or_default();
+        normalized_total += observations.len();
+        merge_observations_into_year(&normalized_path, observations)?;
+        info!(
+            source = source.slug(),
+            station = %station_id,
+            year,
+            normalized = %normalized_path.display(),
+            "wrote normalized parquet year"
         );
     }
 
@@ -288,6 +389,7 @@ async fn normalize_station(app: &App, station_id: &StationId, source: DataSource
 
 #[instrument(skip(app))]
 async fn build_daily(app: &App, station_id: &StationId, year: Option<i32>) -> Result<()> {
+    ensure_normalized_station(app, station_id).await?;
     let observations = load_station_observations(app, station_id)?;
     let builder = DailySummaryBuilder;
     let summaries = builder.build(&observations)?;
@@ -298,6 +400,7 @@ async fn build_daily(app: &App, station_id: &StationId, year: Option<i32>) -> Re
 
 #[instrument(skip(app))]
 async fn build_profiles(app: &App, station_id: &StationId, year: Option<i32>) -> Result<()> {
+    ensure_normalized_station(app, station_id).await?;
     let observations = load_station_observations(app, station_id)?;
     let builder = DayProfileBuilder;
     let profiles = builder.build(&observations)?;
@@ -307,7 +410,12 @@ async fn build_profiles(app: &App, station_id: &StationId, year: Option<i32>) ->
 }
 
 #[instrument(skip(app))]
-async fn query_day(app: &App, station_id: &StationId, date: NaiveDate) -> Result<()> {
+async fn query_day(
+    format: OutputFormat,
+    app: &App,
+    station_id: &StationId,
+    date: NaiveDate,
+) -> Result<()> {
     if date == Local::now().date_naive() {
         ensure_today_current_data(app, station_id).await?;
     }
@@ -323,24 +431,37 @@ async fn query_day(app: &App, station_id: &StationId, date: NaiveDate) -> Result
         .find(|profile| profile.local_date == date)
         .context("no day profile found for date")?;
 
-    println!("station: {station_id}");
-    println!("date: {date}");
-    println!("observations: {}", summary.observation_count);
-    if let Some(high) = summary.high_temp_c {
-        println!("high: {:.1}F", celsius_to_fahrenheit(high));
+    let output = json!({
+        "station": station_id.to_string(),
+        "date": date,
+        "observations": summary.observation_count,
+        "high_f": summary.high_temp_c.map(celsius_to_fahrenheit),
+        "low_f": summary.low_temp_c.map(celsius_to_fahrenheit),
+        "mean_f": summary.mean_temp_c.map(celsius_to_fahrenheit),
+        "observed_hours": profile.observed_hour_count,
+    });
+    if format == OutputFormat::Json {
+        print_json(&output)?;
+    } else {
+        println!("station: {station_id}");
+        println!("date: {date}");
+        println!("observations: {}", summary.observation_count);
+        if let Some(high) = summary.high_temp_c {
+            println!("high: {:.1}F", celsius_to_fahrenheit(high));
+        }
+        if let Some(low) = summary.low_temp_c {
+            println!("low: {:.1}F", celsius_to_fahrenheit(low));
+        }
+        if let Some(mean) = summary.mean_temp_c {
+            println!("mean: {:.1}F", celsius_to_fahrenheit(mean));
+        }
+        println!("observed hours: {}", profile.observed_hour_count);
     }
-    if let Some(low) = summary.low_temp_c {
-        println!("low: {:.1}F", celsius_to_fahrenheit(low));
-    }
-    if let Some(mean) = summary.mean_temp_c {
-        println!("mean: {:.1}F", celsius_to_fahrenheit(mean));
-    }
-    println!("observed hours: {}", profile.observed_hour_count);
     Ok(())
 }
 
 #[instrument(skip(app))]
-async fn query_probability(app: &App, args: ProbabilityArgs) -> Result<()> {
+async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArgs) -> Result<()> {
     let target_date = target_date_or_today(args.date, args.today)?;
     let station_id = StationId::new(&args.station);
     if target_date == Local::now().date_naive() {
@@ -361,32 +482,36 @@ async fn query_probability(app: &App, args: ProbabilityArgs) -> Result<()> {
         as_of_hour,
     );
 
-    println!("station: {}", breakdown.station_id);
-    println!("date: {}", breakdown.target_date);
-    println!("threshold high: {:.1}F", args.threshold_high);
-    for method in &breakdown.methods {
-        println!(
-            "{}: {:.1}% (n={}){}",
-            method.method,
-            method.probability * 100.0,
-            method.sample_size,
-            method
-                .note
-                .as_ref()
-                .map(|note| format!(" [{note}]"))
-                .unwrap_or_default()
-        );
-    }
-    if let Some(combined) = breakdown.combined_probability {
-        println!("combined: {:.1}%", combined * 100.0);
+    if format == OutputFormat::Json {
+        print_json(&breakdown)?;
     } else {
-        println!("combined: unavailable (need at least two methods)");
+        println!("station: {}", breakdown.station_id);
+        println!("date: {}", breakdown.target_date);
+        println!("threshold high: {:.1}F", args.threshold_high);
+        for method in &breakdown.methods {
+            println!(
+                "{}: {:.1}% (n={}){}",
+                method.method,
+                method.probability * 100.0,
+                method.sample_size,
+                method
+                    .note
+                    .as_ref()
+                    .map(|note| format!(" [{note}]"))
+                    .unwrap_or_default()
+            );
+        }
+        if let Some(combined) = breakdown.combined_probability {
+            println!("combined: {:.1}%", combined * 100.0);
+        } else {
+            println!("combined: unavailable (need at least two methods)");
+        }
     }
     Ok(())
 }
 
 #[instrument(skip(app))]
-async fn query_analogs(app: &App, args: AnalogsArgs) -> Result<()> {
+async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Result<()> {
     let target_date = target_date_or_today(args.date, args.today)?;
     let station_id = StationId::new(&args.station);
     if target_date == Local::now().date_naive() {
@@ -408,19 +533,23 @@ async fn query_analogs(app: &App, args: AnalogsArgs) -> Result<()> {
         args.top,
     );
 
-    println!("station: {station_id}");
-    println!("date: {target_date}");
-    println!("top analogs: {}", analogs.len());
-    for analog in analogs {
-        let high = analog
-            .observed_high_c
-            .map(celsius_to_fahrenheit)
-            .map(|value| format!("{value:.1}F"))
-            .unwrap_or_else(|| "n/a".to_owned());
-        println!(
-            "{}  distance={:.3} high={} compared_hours={}",
-            analog.analog_date, analog.distance, high, analog.compared_hours
-        );
+    if format == OutputFormat::Json {
+        print_json(&analogs)?;
+    } else {
+        println!("station: {station_id}");
+        println!("date: {target_date}");
+        println!("top analogs: {}", analogs.len());
+        for analog in analogs {
+            let high = analog
+                .observed_high_c
+                .map(celsius_to_fahrenheit)
+                .map(|value| format!("{value:.1}F"))
+                .unwrap_or_else(|| "n/a".to_owned());
+            println!(
+                "{}  distance={:.3} high={} compared_hours={}",
+                analog.analog_date, analog.distance, high, analog.compared_hours
+            );
+        }
     }
     Ok(())
 }
@@ -456,13 +585,18 @@ fn print_cache_layout(cache: &CacheLayout) {
 
 fn load_station_observations(app: &App, station_id: &StationId) -> Result<Vec<ObservationRecord>> {
     let mut observations = Vec::new();
-    for source in [DataSource::IemAsosOneMinute, DataSource::NwsApi] {
+    for source in [
+        DataSource::NceiAsosFiveMinute,
+        DataSource::IemAsosOneMinute,
+        DataSource::NwsApi,
+        DataSource::Ghcnh,
+    ] {
         let root = app
             .cache
             .source_root(source)
             .join(format!("normalized/station={station_id}"));
-        for path in list_files_recursive(&root, "json")? {
-            let mut file_observations = read_json::<Vec<ObservationRecord>>(&path)?;
+        for path in list_files_recursive(&root, "parquet")? {
+            let mut file_observations = read_observation_records(&path)?;
             debug!(path = %path.display(), count = file_observations.len(), "loaded normalized observation file");
             observations.append(&mut file_observations);
         }
@@ -479,7 +613,7 @@ fn load_daily_for_year(
     station_id: &StationId,
     year: i32,
 ) -> Result<Vec<crate::domain::DailySummary>> {
-    read_json(&app.cache.daily_summary_path(station_id, year))
+    read_daily_summaries(&app.cache.daily_summary_path(station_id, year))
 }
 
 fn load_profiles_for_year(
@@ -487,7 +621,7 @@ fn load_profiles_for_year(
     station_id: &StationId,
     year: i32,
 ) -> Result<Vec<crate::domain::DayProfile>> {
-    read_json(&app.cache.day_profile_path(station_id, year))
+    read_day_profiles(&app.cache.day_profile_path(station_id, year))
 }
 
 fn load_all_daily(app: &App, station_id: &StationId) -> Result<Vec<crate::domain::DailySummary>> {
@@ -496,8 +630,8 @@ fn load_all_daily(app: &App, station_id: &StationId) -> Result<Vec<crate::domain
         .derived_dir
         .join(format!("station={station_id}/daily"));
     let mut all = Vec::new();
-    for path in list_files_recursive(&root, "json")? {
-        let mut values = read_json::<Vec<crate::domain::DailySummary>>(&path)?;
+    for path in list_files_recursive(&root, "parquet")? {
+        let mut values = read_daily_summaries(&path)?;
         all.append(&mut values);
     }
     if all.is_empty() {
@@ -513,8 +647,8 @@ fn load_all_profiles(app: &App, station_id: &StationId) -> Result<Vec<crate::dom
         .derived_dir
         .join(format!("station={station_id}/profiles"));
     let mut all = Vec::new();
-    for path in list_files_recursive(&root, "json")? {
-        let mut values = read_json::<Vec<crate::domain::DayProfile>>(&path)?;
+    for path in list_files_recursive(&root, "parquet")? {
+        let mut values = read_day_profiles(&path)?;
         all.append(&mut values);
     }
     if all.is_empty() {
@@ -560,7 +694,7 @@ fn write_grouped_summaries(
     for year in years {
         let path = app.cache.daily_summary_path(station_id, year);
         let values = grouped.get(&year).cloned().unwrap_or_default();
-        write_json(&path, &values)?;
+        write_daily_summaries(&path, &values)?;
         println!("daily summaries {} -> {}", year, path.display());
     }
     Ok(())
@@ -576,7 +710,7 @@ fn write_grouped_profiles(
     for year in years {
         let path = app.cache.day_profile_path(station_id, year);
         let values = grouped.get(&year).cloned().unwrap_or_default();
-        write_json(&path, &values)?;
+        write_day_profiles(&path, &values)?;
         println!("day profiles {} -> {}", year, path.display());
     }
     Ok(())
@@ -596,6 +730,7 @@ fn collect_years<T>(grouped: &BTreeMap<i32, Vec<T>>, year: Option<i32>) -> Resul
 }
 
 async fn ensure_derived(app: &App, station_id: &StationId, year: i32) -> Result<()> {
+    ensure_normalized_station(app, station_id).await?;
     if !app.cache.daily_summary_path(station_id, year).exists() {
         build_daily(app, station_id, Some(year)).await?;
     }
@@ -605,14 +740,36 @@ async fn ensure_derived(app: &App, station_id: &StationId, year: i32) -> Result<
     Ok(())
 }
 
+async fn ensure_normalized_station(app: &App, station_id: &StationId) -> Result<()> {
+    for source in all_sources() {
+        let normalized_root = app
+            .cache
+            .source_root(source)
+            .join(format!("normalized/station={station_id}"));
+        if count_files(&normalized_root, "parquet")? > 0 {
+            continue;
+        }
+
+        let raw_root = app
+            .cache
+            .source_root(source)
+            .join(format!("raw/station={station_id}"));
+        if count_files(&raw_root, source_raw_extension(source))? == 0 {
+            continue;
+        }
+
+        info!(station = %station_id, source = source.slug(), "rebuilding parquet datasets from cached raw source files");
+        normalize_station(app, station_id, source).await?;
+    }
+    Ok(())
+}
+
 async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<()> {
     let today = Local::now().date_naive();
-    let normalized_path = app.cache.normalized_path(
-        DataSource::NwsApi,
-        station_id,
-        &format!("current-{}", today.format("%Y%m%d")),
-    );
-    if normalized_path.exists() {
+    let normalized_path = app
+        .cache
+        .normalized_path(DataSource::NwsApi, station_id, today.year());
+    if normalized_path.exists() && read_observations_for_date(&normalized_path, today)?.len() > 0 {
         return Ok(());
     }
 
@@ -623,7 +780,7 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
         .sources
         .nws
         .normalize_raw_file(Path::new(&result.path), &station)?;
-    write_json(&normalized_path, &normalized)?;
+    merge_observations_into_year(&normalized_path, normalized)?;
     build_daily(app, station_id, Some(today.year())).await?;
     build_profiles(app, station_id, Some(today.year())).await?;
     Ok(())
@@ -647,13 +804,11 @@ fn resolve_target_profile(
     }
 
     if target_date == Local::now().date_naive() {
-        let current_path = app.cache.normalized_path(
-            DataSource::NwsApi,
-            station_id,
-            &format!("current-{}", target_date.format("%Y%m%d")),
-        );
+        let current_path =
+            app.cache
+                .normalized_path(DataSource::NwsApi, station_id, target_date.year());
         if current_path.exists() {
-            let observations = read_json::<Vec<ObservationRecord>>(&current_path)?;
+            let observations = read_observations_for_date(&current_path, target_date)?;
             let builder = DayProfileBuilder;
             let mut profiles = builder.build(&observations)?;
             return Ok(profiles.pop());
@@ -661,4 +816,76 @@ fn resolve_target_profile(
     }
 
     Ok(None)
+}
+
+fn source_raw_extension(source: DataSource) -> &'static str {
+    match source {
+        DataSource::IemAsosOneMinute => "csv",
+        DataSource::NceiAsosFiveMinute => "dat",
+        DataSource::NwsApi => "json",
+        DataSource::Ghcnh => "psv",
+    }
+}
+
+fn write_observation_records(path: &Path, observations: &[ObservationRecord]) -> Result<()> {
+    let rows = observations
+        .iter()
+        .map(ObservationRow::from_observation)
+        .collect::<Result<Vec<_>>>()?;
+    write_parquet(path, &rows)
+}
+
+fn read_observation_records(path: &Path) -> Result<Vec<ObservationRecord>> {
+    let rows: Vec<ObservationRow> = read_parquet(path)?;
+    rows.into_iter()
+        .map(ObservationRow::into_observation)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn merge_observations_into_year(path: &Path, observations: Vec<ObservationRecord>) -> Result<()> {
+    let existing = if path.exists() {
+        read_observation_records(path)?
+    } else {
+        Vec::new()
+    };
+    let merged = dedupe_observations(existing.into_iter().chain(observations).collect());
+    write_observation_records(path, &merged)
+}
+
+fn read_observations_for_date(
+    path: &Path,
+    target_date: NaiveDate,
+) -> Result<Vec<ObservationRecord>> {
+    Ok(read_observation_records(path)?
+        .into_iter()
+        .filter(|observation| observation.local_date == target_date)
+        .collect())
+}
+
+fn write_daily_summaries(path: &Path, summaries: &[DailySummary]) -> Result<()> {
+    let rows = summaries
+        .iter()
+        .map(DailySummaryRow::from_summary)
+        .collect::<Vec<_>>();
+    write_parquet(path, &rows)
+}
+
+fn read_daily_summaries(path: &Path) -> Result<Vec<DailySummary>> {
+    let rows: Vec<DailySummaryRow> = read_parquet(path)?;
+    rows.into_iter()
+        .map(DailySummaryRow::into_summary)
+        .collect::<Result<Vec<_>>>()
+}
+
+fn write_day_profiles(path: &Path, profiles: &[DayProfile]) -> Result<()> {
+    let rows = profiles
+        .iter()
+        .flat_map(DayProfileRow::from_profile)
+        .collect::<Vec<_>>();
+    write_parquet(path, &rows)
+}
+
+fn read_day_profiles(path: &Path) -> Result<Vec<DayProfile>> {
+    let rows: Vec<DayProfileRow> = read_parquet(path)?;
+    DayProfileRow::into_profiles(rows)
 }

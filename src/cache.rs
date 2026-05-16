@@ -110,10 +110,11 @@ impl CacheLayout {
         source: DataSource,
         station_id: &StationId,
         date: chrono::NaiveDate,
+        name: &str,
         extension: &str,
     ) -> PathBuf {
         self.source_root(source).join(format!(
-            "raw/station={station_id}/date={date}/latest.{extension}"
+            "raw/station={station_id}/date={date}/{name}.{extension}"
         ))
     }
 
@@ -121,20 +122,21 @@ impl CacheLayout {
         &self,
         source: DataSource,
         station_id: &StationId,
-        name: &str,
+        year: i32,
     ) -> PathBuf {
-        self.source_root(source)
-            .join(format!("normalized/station={station_id}/{name}.json"))
+        self.source_root(source).join(format!(
+            "normalized/station={station_id}/year={year}.parquet"
+        ))
     }
 
     pub fn daily_summary_path(&self, station_id: &StationId, year: i32) -> PathBuf {
         self.derived_dir
-            .join(format!("station={station_id}/daily/year={year}.json"))
+            .join(format!("station={station_id}/daily/year={year}.parquet"))
     }
 
     pub fn day_profile_path(&self, station_id: &StationId, year: i32) -> PathBuf {
         self.derived_dir
-            .join(format!("station={station_id}/profiles/year={year}.json"))
+            .join(format!("station={station_id}/profiles/year={year}.parquet"))
     }
 
     pub fn fetch_manifest_path(

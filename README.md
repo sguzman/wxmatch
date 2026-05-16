@@ -20,29 +20,28 @@ The project is aimed at a workflow like:
 - Structured console and rolling JSON file logging with `tracing`
 - Stable cache layout under `.cache/wxmatch/`
 - Station metadata fetch via the NWS API
-- Historical minute-level fetch for `IEM ASOS 1-minute`
-- Current observation fetch for `NWS API`
-- Canonical normalized observation records stored in JSON
-- Daily summary builder
-- Hourly day-profile builder
+- Historical adapters for `IEM ASOS 1-minute`, `NOAA/NCEI ASOS 5-minute`, and `GHCNh`
+- Current observation fetch for `NWS API` with repeated snapshots preserved by timestamp
+- Canonical normalized observations stored in Parquet
+- Derived daily summaries and hourly day profiles stored in Parquet
+- Source precedence for overlapping timestamps: `NCEI 5-minute` -> `IEM 1-minute` -> `NWS API` -> `GHCNh`
 - `query day`
 - `query prob`
 - `query analogs`
+- `--format text|json` for `source list`, `station inspect`, and query commands
 
 ### Planned next
 
-- `NOAA/NCEI ASOS 5-minute` historical adapter
-- `GHCNh` fallback adapter
 - Richer cloud/precipitation coverage in historical ingestion
-- Better current-day partial profile support from multiple live observations
 - Additional probability methods and more formal score blending
-- Machine-readable CLI output modes
+- More calibration and validation around mixed-cadence analog weighting
+- Optional helper commands around DuckDB inspection and migration ergonomics
 
 ## Why These Sources
 
 - `IEM ASOS 1-minute`: fastest path to useful high-frequency U.S. station history with a straightforward download interface.
 - `NOAA/NCEI ASOS 5-minute`: authoritative U.S. archive for later validation and fallback.
-- `NWS API`: easy current-station metadata and latest observation access.
+- `NWS API`: current-station metadata and live observation snapshots for `today` workflows.
 - `GHCNh`: lower-frequency but broad-coverage fallback for future non-ASOS expansion.
 
 ## Cache Philosophy
@@ -50,8 +49,8 @@ The project is aimed at a workflow like:
 `wxmatch` keeps raw downloads and normalized outputs separate.
 
 - Raw files are preserved for reproducibility and debugging.
-- Normalized files are idempotent derived artifacts.
-- Daily summaries and day profiles are built from normalized observations.
+- Normalized Parquet files are idempotent derived artifacts.
+- Daily summaries and day profiles are Parquet datasets built from normalized observations.
 - Logs are written under the cache so command runs are inspectable after the fact.
 
 Default cache root:
@@ -68,13 +67,27 @@ Layout:
     iem-asos-1min/
       raw/
       normalized/
+    ncei-asos-5min/
+      raw/
+      normalized/
     nws-api/
+      raw/
+      normalized/
+    ghcnh/
       raw/
       normalized/
   stations/
   derived/
   manifests/
   logs/
+```
+
+DuckDB-friendly dataset paths:
+
+```text
+sources/<source>/normalized/station=<id>/year=<yyyy>.parquet
+derived/station=<id>/daily/year=<yyyy>.parquet
+derived/station=<id>/profiles/year=<yyyy>.parquet
 ```
 
 ## CLI Shape
@@ -94,12 +107,18 @@ Examples that work today:
 ```bash
 cargo run -- cache show
 cargo run -- source list
+cargo run -- source list --format json
 cargo run -- station inspect KDSM
+cargo run -- station inspect KDSM --format json
 cargo run -- fetch station KDSM --source iem-asos-one-minute --start 2026-05-14 --end 2026-05-14
+cargo run -- fetch station KDSM --source ncei-asos-five-minute --start 2026-05-14 --end 2026-05-14
+cargo run -- fetch station KDSM --source ghcnh --start 2026-05-14 --end 2026-05-14
 cargo run -- normalize station KDSM --source iem-asos-one-minute
+cargo run -- normalize station KDSM --source ncei-asos-five-minute
 cargo run -- build daily KDSM --year 2026
 cargo run -- build profiles KDSM --year 2026
 cargo run -- query day KDSM 2026-05-14
+cargo run -- query day KDSM 2026-05-14 --format json
 cargo run -- query prob KDSM --date 2026-05-14 --threshold-high 75
 cargo run -- fetch current KDSM
 cargo run -- query analogs KDSM --date 2026-05-14 --top 10
@@ -137,12 +156,21 @@ Run formatting:
 cargo fmt
 ```
 
+Inspect cached Parquet with DuckDB:
+
+```bash
+duckdb -c "select local_date, high_temp_c from '~/.cache/wxmatch/derived/station=KDSM/daily/year=2026.parquet' limit 5"
+duckdb -c "select source, observed_at_utc, temperature_c from '~/.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KDSM/year=2026.parquet' limit 5"
+```
+
 ## Notes on v1 Behavior
 
-- The first historical implementation targets the fields reliably exposed by the IEM 1-minute endpoint: temperature, dew point, wind direction, wind speed, and pressure.
+- The IEM path still targets the fields reliably exposed by the 1-minute endpoint: temperature, dew point, wind direction, wind speed, and pressure.
+- The NCEI 5-minute adapter parses METAR-style tokens from the NOAA archive and currently emphasizes temperature, dew point, wind, visibility, cloud code, and altimeter-derived pressure.
+- The GHCNh adapter normalizes the stable hourly fields exposed by the PSV export and acts as a lower-resolution fallback.
 - Relative humidity is derived during normalization when temperature and dew point are present.
-- Current NWS observations add cloud cover, visibility, pressure, and gust fields when available.
-- Analog matching is same-station only in v1 and uses hourly profiles built from normalized observations.
+- Current NWS observations add cloud cover, visibility, pressure, and gust fields when available, and repeated fetches keep multiple same-day raw snapshots.
+- Analog matching is same-station only in the current implementation and uses hourly profiles built from normalized observations.
 
 ## Project Plan
 
