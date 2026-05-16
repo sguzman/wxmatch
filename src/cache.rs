@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use directories::BaseDirs;
 use serde::Serialize;
 use tracing::{debug, info, instrument};
 
@@ -40,10 +39,10 @@ impl CacheLayout {
     pub fn resolve(override_dir: Option<&Path>) -> Result<Self> {
         let root = match override_dir {
             Some(path) => path.to_path_buf(),
-            None => {
-                let base = BaseDirs::new().context("unable to resolve user cache directory")?;
-                base.cache_dir().join(APP_NAME)
-            }
+            None => std::env::current_dir()
+                .context("unable to resolve current working directory")?
+                .join(".cache")
+                .join(APP_NAME),
         };
 
         Ok(Self {
@@ -215,5 +214,12 @@ mod tests {
         let layout = CacheLayout::resolve(Some(Path::new("/tmp/wxmatch-test"))).unwrap();
         assert_eq!(layout.root, Path::new("/tmp/wxmatch-test"));
         assert_eq!(layout.logs_dir, Path::new("/tmp/wxmatch-test/logs"));
+    }
+
+    #[test]
+    fn defaults_to_repo_local_cache_dir() {
+        let expected = std::env::current_dir().unwrap().join(".cache").join("wxmatch");
+        let layout = CacheLayout::resolve(None).unwrap();
+        assert_eq!(layout.root, expected);
     }
 }

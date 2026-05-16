@@ -58,7 +58,7 @@ The project is aimed at a workflow like:
 Default cache root:
 
 ```text
-~/.cache/wxmatch/
+.cache/wxmatch/
 ```
 
 Layout:
@@ -192,8 +192,8 @@ bash scripts/acceptance_matrix.sh
 Inspect cached Parquet with DuckDB:
 
 ```bash
-duckdb -c "select local_date, high_temp_c from '~/.cache/wxmatch/derived/station=KLAX/daily/year=2026.parquet' limit 5"
-duckdb -c "select source, observed_at_utc, temperature_c from '~/.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KLAX/year=2026.parquet' limit 5"
+duckdb -c "select local_date, high_temp_c from '.cache/wxmatch/derived/station=KLAX/daily/year=2026.parquet' limit 5"
+duckdb -c "select source, observed_at_utc, temperature_c from '.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KLAX/year=2026.parquet' limit 5"
 cargo run -- query duckdb-paths --station KLAX --year 2026
 ```
 
