@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::domain::{
-    AnalogResult, DailySummary, DayProfile, HourlyProfilePoint, ObservationRecord,
-    ProbabilityBreakdown, ProbabilityEstimate, StationId,
+    AnalogResult, DailySummary, DayProfile, HourlyProfilePoint, MethodAvailability,
+    ObservationRecord, ProbabilityBreakdown, ProbabilityEstimate, StationId,
 };
 use anyhow::{Result, bail};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
@@ -26,7 +26,12 @@ pub trait ProbabilityMethod {
         profiles: &[DayProfile],
         target_profile: Option<&DayProfile>,
         as_of_hour: Option<u8>,
-    ) -> Option<ProbabilityEstimate>;
+    ) -> ProbabilityMethodOutcome;
+}
+
+pub enum ProbabilityMethodOutcome {
+    Available(ProbabilityEstimate),
+    Unavailable(MethodAvailability),
 }
 
 pub fn dedupe_observations(observations: Vec<ObservationRecord>) -> Vec<ObservationRecord> {
@@ -216,7 +221,7 @@ impl ProbabilityMethod for ClimatologyMethod {
         _profiles: &[DayProfile],
         _target_profile: Option<&DayProfile>,
         _as_of_hour: Option<u8>,
-    ) -> Option<ProbabilityEstimate> {
+    ) -> ProbabilityMethodOutcome {
         let mut matches = 0usize;
         let mut hits = 0usize;
         let target_ordinal = target_date.ordinal() as i32;
@@ -234,14 +239,100 @@ impl ProbabilityMethod for ClimatologyMethod {
         }
 
         if matches == 0 {
-            return None;
+            return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+                method: self.name().to_owned(),
+                reason: "no daily summaries matched the seasonal window".to_owned(),
+            });
         }
 
-        Some(ProbabilityEstimate {
+        ProbabilityMethodOutcome::Available(ProbabilityEstimate {
             method: self.name().to_owned(),
             probability: hits as f64 / matches as f64,
             sample_size: matches,
             note: Some(format!("window=+/-{} calendar days", self.window_days)),
+        })
+    }
+}
+
+pub struct TrajectoryMethod;
+
+impl ProbabilityMethod for TrajectoryMethod {
+    fn name(&self) -> &'static str {
+        "temperature-trajectory"
+    }
+
+    fn estimate(
+        &self,
+        _station_id: &StationId,
+        target_date: NaiveDate,
+        threshold_high_c: f64,
+        daily: &[DailySummary],
+        profiles: &[DayProfile],
+        target_profile: Option<&DayProfile>,
+        as_of_hour: Option<u8>,
+    ) -> ProbabilityMethodOutcome {
+        let Some(target_profile) = target_profile else {
+            return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+                method: self.name().to_owned(),
+                reason: "no target profile is available".to_owned(),
+            });
+        };
+
+        let limit_hour =
+            as_of_hour.unwrap_or_else(|| latest_observed_hour(target_profile).unwrap_or(23));
+        let Some((target_temp, target_slope)) =
+            target_temperature_signature(target_profile, limit_hour)
+        else {
+            return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+                method: self.name().to_owned(),
+                reason: "not enough observed hours to compute a temperature trajectory".to_owned(),
+            });
+        };
+
+        let daily_highs: HashMap<NaiveDate, Option<f64>> = daily
+            .iter()
+            .map(|summary| (summary.local_date, summary.high_temp_c))
+            .collect();
+        let mut weighted_hits = 0.0;
+        let mut total_weight = 0.0;
+        let mut sample_size = 0usize;
+
+        for profile in profiles.iter().filter(|profile| profile.local_date != target_date) {
+            let Some((candidate_temp, candidate_slope)) =
+                target_temperature_signature(profile, limit_hour)
+            else {
+                continue;
+            };
+            let Some(high) = daily_highs.get(&profile.local_date).copied().flatten() else {
+                continue;
+            };
+            let temp_delta = (candidate_temp - target_temp) / 8.0;
+            let slope_delta = (candidate_slope - target_slope) / 4.0;
+            let distance = (temp_delta * temp_delta + slope_delta * slope_delta).sqrt();
+            let weight = 1.0 / (distance + 0.1);
+            total_weight += weight;
+            sample_size += 1;
+            if high >= threshold_high_c {
+                weighted_hits += weight;
+            }
+        }
+
+        if total_weight <= f64::EPSILON {
+            return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+                method: self.name().to_owned(),
+                reason: "no historical profiles had enough same-hour temperature coverage"
+                    .to_owned(),
+            });
+        }
+
+        ProbabilityMethodOutcome::Available(ProbabilityEstimate {
+            method: self.name().to_owned(),
+            probability: weighted_hits / total_weight,
+            sample_size,
+            note: Some(format!(
+                "compares latest temperature and warming rate through hour {}",
+                limit_hour
+            )),
         })
     }
 }
@@ -255,11 +346,14 @@ pub fn build_probability_breakdown(
     target_profile: Option<&DayProfile>,
     as_of_hour: Option<u8>,
 ) -> ProbabilityBreakdown {
-    let methods: Vec<Box<dyn ProbabilityMethod>> =
-        vec![Box::new(ClimatologyMethod { window_days: 15 })];
+    let methods: Vec<Box<dyn ProbabilityMethod>> = vec![
+        Box::new(ClimatologyMethod { window_days: 15 }),
+        Box::new(TrajectoryMethod),
+    ];
     let mut estimates = Vec::new();
+    let mut unavailable_methods = Vec::new();
     for method in methods {
-        if let Some(estimate) = method.estimate(
+        match method.estimate(
             &station_id,
             target_date,
             threshold_high_c,
@@ -268,7 +362,10 @@ pub fn build_probability_breakdown(
             target_profile,
             as_of_hour,
         ) {
-            estimates.push(estimate);
+            ProbabilityMethodOutcome::Available(estimate) => estimates.push(estimate),
+            ProbabilityMethodOutcome::Unavailable(unavailable) => {
+                unavailable_methods.push(unavailable)
+            }
         }
     }
 
@@ -281,8 +378,9 @@ pub fn build_probability_breakdown(
         target_profile,
         as_of_hour,
     );
-    if let Some(estimate) = analog_estimate {
-        estimates.push(estimate);
+    match analog_estimate {
+        ProbabilityMethodOutcome::Available(estimate) => estimates.push(estimate),
+        ProbabilityMethodOutcome::Unavailable(unavailable) => unavailable_methods.push(unavailable),
     }
 
     let combined_probability = if estimates.len() >= 2 {
@@ -302,6 +400,7 @@ pub fn build_probability_breakdown(
         target_date,
         threshold_high_c,
         methods: estimates,
+        unavailable_methods,
         combined_probability,
     }
 }
@@ -358,8 +457,13 @@ fn analog_probability_estimate(
     profiles: &[DayProfile],
     target_profile: Option<&DayProfile>,
     as_of_hour: Option<u8>,
-) -> Option<ProbabilityEstimate> {
-    let target_profile = target_profile?;
+) -> ProbabilityMethodOutcome {
+    let Some(target_profile) = target_profile else {
+        return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+            method: analog_method_name(as_of_hour).to_owned(),
+            reason: "no target profile is available".to_owned(),
+        });
+    };
     let analogs = top_analogs(
         station_id,
         target_date,
@@ -370,7 +474,10 @@ fn analog_probability_estimate(
         30,
     );
     if analogs.is_empty() {
-        return None;
+        return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+            method: analog_method_name(as_of_hour).to_owned(),
+            reason: "no comparable analog profiles were found".to_owned(),
+        });
     }
 
     let mut weighted_hits = 0.0;
@@ -386,15 +493,14 @@ fn analog_probability_estimate(
     }
 
     if total_weight <= f64::EPSILON {
-        return None;
+        return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+            method: analog_method_name(as_of_hour).to_owned(),
+            reason: "analog matches did not include usable observed highs".to_owned(),
+        });
     }
 
-    Some(ProbabilityEstimate {
-        method: if as_of_hour.is_some() {
-            "partial-profile-analogs".to_owned()
-        } else {
-            "nearest-neighbor-analogs".to_owned()
-        },
+    ProbabilityMethodOutcome::Available(ProbabilityEstimate {
+        method: analog_method_name(as_of_hour).to_owned(),
         probability: weighted_hits / total_weight,
         sample_size: analogs.len(),
         note: Some("weighted by inverse profile distance".to_owned()),
@@ -417,16 +523,52 @@ fn profile_distance(
         }
         let left_hour = left.hours.get(hour)?;
         let right_hour = right.hours.get(hour)?;
-        let point_distance = hourly_distance(left_hour, right_hour)?;
-        total += point_distance;
-        count += 1;
+        if let Some(point_distance) = hourly_distance(left_hour, right_hour) {
+            total += point_distance;
+            count += 1;
+        }
     }
 
-    if count == 0 {
+    let min_required = if as_of_hour.is_some() { 2 } else { 6 };
+    if count < min_required {
         return None;
     }
 
     Some((total / count as f64, count))
+}
+
+fn analog_method_name(as_of_hour: Option<u8>) -> &'static str {
+    if as_of_hour.is_some() {
+        "partial-profile-analogs"
+    } else {
+        "nearest-neighbor-analogs"
+    }
+}
+
+fn latest_observed_hour(profile: &DayProfile) -> Option<u8> {
+    profile
+        .hours
+        .iter()
+        .rev()
+        .find(|hour| hour.sample_count > 0 && hour.temperature_c.is_some())
+        .map(|hour| hour.hour)
+}
+
+fn target_temperature_signature(profile: &DayProfile, limit_hour: u8) -> Option<(f64, f64)> {
+    let mut observed = profile
+        .hours
+        .iter()
+        .filter(|hour| hour.hour <= limit_hour)
+        .filter_map(|hour| hour.temperature_c.map(|temp| (hour.hour, temp)))
+        .collect::<Vec<_>>();
+    observed.sort_by_key(|(hour, _)| *hour);
+    let (first_hour, first_temp) = *observed.first()?;
+    let (last_hour, last_temp) = *observed.last()?;
+    if observed.len() < 2 || first_hour == last_hour {
+        return None;
+    }
+    let slope = (last_temp - first_temp) / f64::from(last_hour - first_hour);
+    Some((last_temp, slope))
 }
 
 fn hourly_distance(left: &HourlyProfilePoint, right: &HourlyProfilePoint) -> Option<f64> {
@@ -525,7 +667,8 @@ mod tests {
 
     use super::{
         ClimatologyMethod, DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder,
-        ProbabilityMethod, build_probability_breakdown, dedupe_observations, top_analogs,
+        ProbabilityMethod, TrajectoryMethod, build_probability_breakdown, dedupe_observations,
+        top_analogs,
     };
 
     fn observation(station: &str, date: &str, temp: f64) -> ObservationRecord {
@@ -605,19 +748,23 @@ mod tests {
         ];
         let daily = DailySummaryBuilder.build(&observations).unwrap();
         let method = ClimatologyMethod { window_days: 1 };
-        let estimate = method
-            .estimate(
-                &StationId::new("KDSM"),
-                chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
-                24.0,
-                &daily,
-                &[],
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(estimate.sample_size, 3);
-        assert!((estimate.probability - (2.0 / 3.0)).abs() < 1e-9);
+        match method.estimate(
+            &StationId::new("KDSM"),
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
+            24.0,
+            &daily,
+            &[],
+            None,
+            None,
+        ) {
+            super::ProbabilityMethodOutcome::Available(estimate) => {
+                assert_eq!(estimate.sample_size, 3);
+                assert!((estimate.probability - (2.0 / 3.0)).abs() < 1e-9);
+            }
+            super::ProbabilityMethodOutcome::Unavailable(reason) => {
+                panic!("climatology unexpectedly unavailable: {reason:?}")
+            }
+        }
     }
 
     #[test]
@@ -660,5 +807,102 @@ mod tests {
         );
         assert!(breakdown.methods.len() >= 2);
         assert!(breakdown.combined_probability.is_some());
+        assert!(breakdown.unavailable_methods.is_empty());
+    }
+
+    #[test]
+    fn sparse_profiles_can_still_match_when_some_hours_are_missing() {
+        let mut left = observation("KDSM", "2026-05-14 00:00", 20.0);
+        let mut right = observation("KDSM", "2026-05-13 00:00", 20.0);
+        left.relative_humidity_pct = None;
+        right.relative_humidity_pct = None;
+        let observations = vec![
+            left,
+            observation("KDSM", "2026-05-14 03:00", 24.0),
+            right,
+            observation("KDSM", "2026-05-13 03:00", 24.0),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+        let analogs = top_analogs(
+            &StationId::new("KDSM"),
+            target_date,
+            &daily,
+            &profiles,
+            target_profile,
+            Some(3),
+            5,
+        );
+        assert_eq!(analogs.len(), 1);
+        assert_eq!(analogs[0].compared_hours, 2);
+    }
+
+    #[test]
+    fn reports_unavailable_methods_when_target_profile_is_missing() {
+        let observations = vec![observation("KDSM", "2024-05-14 00:00", 25.0)];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let breakdown = build_probability_breakdown(
+            StationId::new("KDSM"),
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
+            24.0,
+            &daily,
+            &profiles,
+            None,
+            Some(4),
+        );
+        assert!(
+            breakdown
+                .unavailable_methods
+                .iter()
+                .any(|method| method.method == "partial-profile-analogs")
+        );
+        assert!(
+            breakdown
+                .unavailable_methods
+                .iter()
+                .any(|method| method.method == "temperature-trajectory")
+        );
+    }
+
+    #[test]
+    fn trajectory_method_estimates_when_hours_exist() {
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 20.0),
+            observation("KDSM", "2024-05-14 03:00", 24.0),
+            observation("KDSM", "2025-05-14 00:00", 21.0),
+            observation("KDSM", "2025-05-14 03:00", 25.0),
+            observation("KDSM", "2026-05-14 00:00", 20.5),
+            observation("KDSM", "2026-05-14 03:00", 24.5),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+        match TrajectoryMethod.estimate(
+            &StationId::new("KDSM"),
+            target_date,
+            23.0,
+            &daily,
+            &profiles,
+            Some(target_profile),
+            Some(3),
+        ) {
+            super::ProbabilityMethodOutcome::Available(estimate) => {
+                assert!(estimate.probability > 0.0);
+                assert!(estimate.sample_size >= 2);
+            }
+            super::ProbabilityMethodOutcome::Unavailable(reason) => {
+                panic!("trajectory method unexpectedly unavailable: {reason:?}")
+            }
+        }
     }
 }

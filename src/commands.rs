@@ -498,8 +498,11 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
                     .note
                     .as_ref()
                     .map(|note| format!(" [{note}]"))
-                    .unwrap_or_default()
+                .unwrap_or_default()
             );
+        }
+        for unavailable in &breakdown.unavailable_methods {
+            println!("{}: unavailable [{}]", unavailable.method, unavailable.reason);
         }
         if let Some(combined) = breakdown.combined_probability {
             println!("combined: {:.1}%", combined * 100.0);

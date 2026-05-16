@@ -153,11 +153,18 @@ pub struct ProbabilityEstimate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MethodAvailability {
+    pub method: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbabilityBreakdown {
     pub station_id: StationId,
     pub target_date: NaiveDate,
     pub threshold_high_c: f64,
     pub methods: Vec<ProbabilityEstimate>,
+    pub unavailable_methods: Vec<MethodAvailability>,
     pub combined_probability: Option<f64>,
 }
 
