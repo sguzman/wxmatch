@@ -192,7 +192,7 @@ And:
 - normalized and derived cache artifacts are written as Parquet
 - cache artifacts are directly queryable from DuckDB
 - atomic writes prevent torn Parquet/manifest reads during concurrent `today` queries
-- the checked-in acceptance matrix succeeds on `KDSM` and `KDEN`
+- the checked-in acceptance matrix succeeds on `KLAX` and `KDEN`
 
 Acceptance runner:
 

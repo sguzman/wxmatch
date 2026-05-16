@@ -110,25 +110,25 @@ Examples that work today:
 cargo run -- cache show
 cargo run -- source list
 cargo run -- source list --format json
-cargo run -- station inspect KDSM
-cargo run -- station inspect KDSM --format json
-cargo run -- cache manifests --station KDSM
-cargo run -- cache manifests --station KDSM --format json
-cargo run -- fetch station KDSM --source iem-asos-one-minute --start 2026-05-14 --end 2026-05-14
-cargo run -- fetch station KDSM --source ncei-asos-five-minute --start 2026-05-14 --end 2026-05-14
-cargo run -- fetch station KDSM --source ghcnh --start 2026-05-14 --end 2026-05-14
-cargo run -- normalize station KDSM --source iem-asos-one-minute
-cargo run -- normalize station KDSM --source ncei-asos-five-minute
-cargo run -- build daily KDSM --year 2026
-cargo run -- build profiles KDSM --year 2026
-cargo run -- query day KDSM 2026-05-14
-cargo run -- query day KDSM 2026-05-14 --format json
-cargo run -- query prob KDSM --date 2026-05-14 --threshold-high 75
-cargo run -- query prob KDSM --today --threshold-high 80 --format json
-cargo run -- fetch current KDSM
-cargo run -- query analogs KDSM --date 2026-05-14 --top 10
+cargo run -- station inspect KLAX
+cargo run -- station inspect KLAX --format json
+cargo run -- cache manifests --station KLAX
+cargo run -- cache manifests --station KLAX --format json
+cargo run -- fetch station KLAX --source iem-asos-one-minute --start 2026-05-14 --end 2026-05-14
+cargo run -- fetch station KLAX --source ncei-asos-five-minute --start 2026-05-14 --end 2026-05-14
+cargo run -- fetch station KLAX --source ghcnh --start 2026-05-14 --end 2026-05-14
+cargo run -- normalize station KLAX --source iem-asos-one-minute
+cargo run -- normalize station KLAX --source ncei-asos-five-minute
+cargo run -- build daily KLAX --year 2026
+cargo run -- build profiles KLAX --year 2026
+cargo run -- query day KLAX 2026-05-14
+cargo run -- query day KLAX 2026-05-14 --format json
+cargo run -- query prob KLAX --date 2026-05-14 --threshold-high 75
+cargo run -- query prob KLAX --today --threshold-high 80 --format json
+cargo run -- fetch current KLAX
+cargo run -- query analogs KLAX --date 2026-05-14 --top 10
 cargo run -- query analogs KDEN --today --top 3 --format json
-cargo run -- query duckdb-paths --station KDSM --year 2026
+cargo run -- query duckdb-paths --station KLAX --year 2026
 ```
 
 ## Probability Output
@@ -192,9 +192,9 @@ bash scripts/acceptance_matrix.sh
 Inspect cached Parquet with DuckDB:
 
 ```bash
-duckdb -c "select local_date, high_temp_c from '~/.cache/wxmatch/derived/station=KDSM/daily/year=2026.parquet' limit 5"
-duckdb -c "select source, observed_at_utc, temperature_c from '~/.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KDSM/year=2026.parquet' limit 5"
-cargo run -- query duckdb-paths --station KDSM --year 2026
+duckdb -c "select local_date, high_temp_c from '~/.cache/wxmatch/derived/station=KLAX/daily/year=2026.parquet' limit 5"
+duckdb -c "select source, observed_at_utc, temperature_c from '~/.cache/wxmatch/sources/ncei-asos-5min/normalized/station=KLAX/year=2026.parquet' limit 5"
+cargo run -- query duckdb-paths --station KLAX --year 2026
 ```
 
 ## Notes on v1 Behavior
@@ -216,7 +216,7 @@ cargo run -- query duckdb-paths --station KDSM --year 2026
 The current hardening bar is:
 
 - deterministic unit coverage for query-quality state, sparse-day behavior, manifest warnings, and weighted combination
-- acceptance flow on `KDSM` and `KDEN`
+- acceptance flow on `KLAX` and `KDEN`
 - operator checks via `source list --format json`, `station inspect --format json`, and `cache doctor`
 - clean `cache doctor` after rebuilding derived datasets following any live `today` query
 
