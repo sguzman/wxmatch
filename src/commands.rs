@@ -671,53 +671,73 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
     ensure_derived(app, &station_id, target_date.year()).await?;
     let daily = load_all_daily(app, &station_id)?;
     let profiles = load_all_profiles(app, &station_id)?;
-    let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?
-        .context("no target profile available for analog search")?;
     let as_of_hour = args.as_of.map(|time| time.hour() as u8);
-    let analogs = top_analogs(
-        &station_id,
-        target_date,
-        &daily,
-        &profiles,
-        &target_profile,
-        as_of_hour,
-        args.top,
-    );
     let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
-    let quality_state = probability_quality_state(
-        target_date,
-        Some(&target_profile),
-        &daily,
-        &profiles,
-        as_of_hour,
-    );
-    let quality_note = quality_note_for_day(
-        target_profile.observed_hour_count,
-        &target_profile.source_slugs,
-    );
-    let status_note = if analogs.is_empty() {
-        if target_profile.observed_hour_count < minimum_analog_hours(as_of_hour) {
-            Some(format!(
-                "insufficient observed hours for analog search: {} observed, {} required",
+    let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    let (analogs, target_observed_hours, quality_state, quality_note, status_note) =
+        if let Some(target_profile) = target_profile {
+            let analogs = top_analogs(
+                &station_id,
+                target_date,
+                &daily,
+                &profiles,
+                &target_profile,
+                as_of_hour,
+                args.top,
+            );
+            let quality_state = probability_quality_state(
+                target_date,
+                Some(&target_profile),
+                &daily,
+                &profiles,
+                as_of_hour,
+            );
+            let quality_note = quality_note_for_day(
                 target_profile.observed_hour_count,
-                minimum_analog_hours(as_of_hour)
-            ))
+                &target_profile.source_slugs,
+            );
+            let status_note = if analogs.is_empty() {
+                if target_profile.observed_hour_count < minimum_analog_hours(as_of_hour) {
+                    Some(format!(
+                        "insufficient observed hours for analog search: {} observed, {} required",
+                        target_profile.observed_hour_count,
+                        minimum_analog_hours(as_of_hour)
+                    ))
+                } else {
+                    Some(format!(
+                        "no comparable analogs found for target profile with {} observed hours",
+                        target_profile.observed_hour_count
+                    ))
+                }
+            } else {
+                None
+            };
+            (
+                analogs,
+                Some(target_profile.observed_hour_count),
+                quality_state,
+                quality_note,
+                status_note,
+            )
         } else {
-            Some(format!(
-                "no comparable analogs found for target profile with {} observed hours",
-                target_profile.observed_hour_count
-            ))
-        }
-    } else {
-        None
-    };
+            (
+                Vec::new(),
+                None,
+                "normal".to_owned(),
+                None,
+                Some(format!(
+                    "no target profile is available for {}. fetch, normalize, and build data for that date first",
+                    target_date
+                )),
+            )
+        };
 
     if format == OutputFormat::Json {
         let output = json!({
             "analogs": analogs,
             "freshness_note": freshness_note,
             "status_note": status_note,
-            "target_observed_hours": target_profile.observed_hour_count,
+            "target_observed_hours": target_observed_hours,
             "quality_state": quality_state,
             "quality_note": quality_note,
         });
@@ -726,10 +746,11 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
         println!("station: {station_id}");
         println!("date: {target_date}");
         println!("top analogs: {}", analogs.len());
-        println!(
-            "target observed hours: {}",
-            target_profile.observed_hour_count
-        );
+        if let Some(target_observed_hours) = target_observed_hours {
+            println!("target observed hours: {target_observed_hours}");
+        } else {
+            println!("target observed hours: n/a");
+        }
         println!("quality state: {quality_state}");
         if let Some(freshness_note) = freshness_note {
             println!("freshness: {freshness_note}");
@@ -1896,6 +1917,7 @@ fn station_normalized_manifests_for_source(
 #[cfg(test)]
 mod tests {
     use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+    use serde_json::json;
 
     use crate::domain::{ObservationRecord, StationId};
     use crate::source::DataSource;
@@ -1954,6 +1976,25 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("source availability or parser coverage"))
         );
+    }
+
+    #[test]
+    fn analogs_json_can_report_missing_target_profile() {
+        let output = json!({
+            "analogs": Vec::<serde_json::Value>::new(),
+            "freshness_note": serde_json::Value::Null,
+            "status_note": "no target profile is available for 2026-05-15. fetch, normalize, and build data for that date first",
+            "target_observed_hours": serde_json::Value::Null,
+            "quality_state": "normal",
+            "quality_note": serde_json::Value::Null,
+        });
+
+        assert_eq!(output["analogs"].as_array().unwrap().len(), 0);
+        assert!(output["status_note"]
+            .as_str()
+            .unwrap()
+            .contains("no target profile is available"));
+        assert!(output["target_observed_hours"].is_null());
     }
 }
 
