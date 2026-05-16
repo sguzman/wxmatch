@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::domain::{
     AnalogResult, DailySummary, DayProfile, HourlyProfilePoint, ObservationRecord,
@@ -27,6 +27,23 @@ pub trait ProbabilityMethod {
         target_profile: Option<&DayProfile>,
         as_of_hour: Option<u8>,
     ) -> Option<ProbabilityEstimate>;
+}
+
+pub fn dedupe_observations(observations: Vec<ObservationRecord>) -> Vec<ObservationRecord> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for observation in observations {
+        let key = (
+            observation.source,
+            observation.station_id.to_string(),
+            observation.observed_at_utc,
+        );
+        if seen.insert(key) {
+            deduped.push(observation);
+        }
+    }
+    deduped.sort_by_key(|observation| observation.observed_at_utc);
+    deduped
 }
 
 pub struct DailySummaryBuilder;
@@ -484,7 +501,10 @@ mod tests {
     use crate::domain::{ObservationRecord, StationId};
     use crate::source::DataSource;
 
-    use super::{DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder};
+    use super::{
+        ClimatologyMethod, DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder,
+        ProbabilityMethod, build_probability_breakdown, dedupe_observations, top_analogs,
+    };
 
     fn observation(station: &str, date: &str, temp: f64) -> ObservationRecord {
         let offset = FixedOffset::west_opt(6 * 3600).unwrap();
@@ -498,6 +518,10 @@ mod tests {
             "raw.csv".to_owned(),
         );
         observation.temperature_c = Some(temp);
+        observation.dewpoint_c = Some(temp - 5.0);
+        observation.relative_humidity_pct = Some(50.0);
+        observation.wind_u_kt = Some(1.0);
+        observation.wind_v_kt = Some(1.0);
         observation
     }
 
@@ -525,5 +549,80 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].observed_hour_count, 2);
         assert_eq!(profiles[0].hours[0].temperature_c, Some(21.0));
+    }
+
+    #[test]
+    fn dedupes_observations_by_source_station_and_time() {
+        let left = observation("KDSM", "2026-05-14 00:00", 20.0);
+        let right = observation("KDSM", "2026-05-14 00:00", 22.0);
+        let deduped = dedupe_observations(vec![left.clone(), right]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].temperature_c, left.temperature_c);
+    }
+
+    #[test]
+    fn climatology_estimate_counts_hits() {
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 25.0),
+            observation("KDSM", "2025-05-14 00:00", 28.0),
+            observation("KDSM", "2026-05-14 00:00", 18.0),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let method = ClimatologyMethod { window_days: 1 };
+        let estimate = method
+            .estimate(
+                &StationId::new("KDSM"),
+                chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap(),
+                24.0,
+                &daily,
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(estimate.sample_size, 3);
+        assert!((estimate.probability - (2.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn produces_analogs_and_combined_probability() {
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 25.0),
+            observation("KDSM", "2024-05-14 01:00", 26.0),
+            observation("KDSM", "2025-05-14 00:00", 25.0),
+            observation("KDSM", "2025-05-14 01:00", 26.0),
+            observation("KDSM", "2026-05-14 00:00", 25.0),
+            observation("KDSM", "2026-05-14 01:00", 26.0),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+
+        let analogs = top_analogs(
+            &StationId::new("KDSM"),
+            target_date,
+            &daily,
+            &profiles,
+            target_profile,
+            Some(1),
+            5,
+        );
+        assert_eq!(analogs.len(), 2);
+
+        let breakdown = build_probability_breakdown(
+            StationId::new("KDSM"),
+            target_date,
+            24.0,
+            &daily,
+            &profiles,
+            Some(target_profile),
+            Some(1),
+        );
+        assert!(breakdown.methods.len() >= 2);
+        assert!(breakdown.combined_probability.is_some());
     }
 }

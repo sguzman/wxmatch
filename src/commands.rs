@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -17,7 +16,7 @@ use crate::cli::{
 use crate::domain::{ObservationRecord, StationId, celsius_to_fahrenheit};
 use crate::engine::{
     DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder, build_probability_breakdown,
-    target_date_or_today, top_analogs,
+    dedupe_observations, target_date_or_today, top_analogs,
 };
 use crate::source::{DataSource, SourceDescriptor, all_sources};
 use crate::sources::WeatherSourceAdapter;
@@ -74,6 +73,36 @@ async fn handle_station(app: &App, command: StationCommand) -> Result<()> {
         StationSubcommand::Inspect { station } => {
             let station_id = StationId::new(&station);
             let station_record = app.sources.nws.fetch_station_metadata(&station_id).await?;
+            let raw_iem = count_files(
+                &app.cache
+                    .source_root(DataSource::IemAsosOneMinute)
+                    .join(format!("raw/station={station_id}")),
+                "csv",
+            )?;
+            let normalized_iem = count_files(
+                &app.cache
+                    .source_root(DataSource::IemAsosOneMinute)
+                    .join(format!("normalized/station={station_id}")),
+                "json",
+            )?;
+            let normalized_nws = count_files(
+                &app.cache
+                    .source_root(DataSource::NwsApi)
+                    .join(format!("normalized/station={station_id}")),
+                "json",
+            )?;
+            let daily_years = count_files(
+                &app.cache
+                    .derived_dir
+                    .join(format!("station={station_id}/daily")),
+                "json",
+            )?;
+            let profile_years = count_files(
+                &app.cache
+                    .derived_dir
+                    .join(format!("station={station_id}/profiles")),
+                "json",
+            )?;
             println!("station: {}", station_record.station_id);
             println!("source station id: {}", station_record.source_station_id);
             println!("name: {}", station_record.name);
@@ -95,6 +124,11 @@ async fn handle_station(app: &App, command: StationCommand) -> Result<()> {
                 "station cache: {}",
                 app.cache.station_metadata_path(&station_id).display()
             );
+            println!("iem raw files: {raw_iem}");
+            println!("iem normalized files: {normalized_iem}");
+            println!("nws normalized files: {normalized_nws}");
+            println!("daily years built: {daily_years}");
+            println!("profile years built: {profile_years}");
         }
     }
 
@@ -422,7 +456,6 @@ fn print_cache_layout(cache: &CacheLayout) {
 
 fn load_station_observations(app: &App, station_id: &StationId) -> Result<Vec<ObservationRecord>> {
     let mut observations = Vec::new();
-    let mut seen = HashSet::new();
     for source in [DataSource::IemAsosOneMinute, DataSource::NwsApi] {
         let root = app
             .cache
@@ -431,19 +464,10 @@ fn load_station_observations(app: &App, station_id: &StationId) -> Result<Vec<Ob
         for path in list_files_recursive(&root, "json")? {
             let mut file_observations = read_json::<Vec<ObservationRecord>>(&path)?;
             debug!(path = %path.display(), count = file_observations.len(), "loaded normalized observation file");
-            for observation in file_observations.drain(..) {
-                let key = (
-                    observation.source,
-                    observation.station_id.to_string(),
-                    observation.observed_at_utc,
-                );
-                if seen.insert(key) {
-                    observations.push(observation);
-                }
-            }
+            observations.append(&mut file_observations);
         }
     }
-    observations.sort_by_key(|observation| observation.observed_at_utc);
+    observations = dedupe_observations(observations);
     if observations.is_empty() {
         bail!("no normalized observations found for station {station_id}");
     }
@@ -603,6 +627,10 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
     build_daily(app, station_id, Some(today.year())).await?;
     build_profiles(app, station_id, Some(today.year())).await?;
     Ok(())
+}
+
+fn count_files(root: &Path, ext: &str) -> Result<usize> {
+    Ok(list_files_recursive(root, ext)?.len())
 }
 
 fn resolve_target_profile(
