@@ -24,7 +24,8 @@ use crate::domain::{
 };
 use crate::engine::{
     DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder, build_probability_breakdown,
-    dedupe_observations, target_date_or_today, top_analogs,
+    dedupe_observations, minimum_analog_hours, probability_quality_state, target_date_or_today,
+    top_analogs,
 };
 use crate::source::{DataSource, SourceDescriptor, all_sources};
 use crate::sources::WeatherSourceAdapter;
@@ -518,6 +519,8 @@ async fn query_day(
         .find(|profile| profile.local_date == date)
         .context("no day profile found for date")?;
     let freshness_note = current_day_freshness_note(app, station_id, date)?;
+    let quality_state = quality_state_for_day(profile.observed_hour_count, &summary.source_slugs);
+    let quality_note = quality_note_for_day(profile.observed_hour_count, &summary.source_slugs);
 
     let output = json!({
         "station": station_id.to_string(),
@@ -529,6 +532,8 @@ async fn query_day(
         "observed_hours": profile.observed_hour_count,
         "sources": summary.source_slugs,
         "freshness_note": freshness_note,
+        "quality_state": quality_state,
+        "quality_note": quality_note,
     });
     if format == OutputFormat::Json {
         print_json(&output)?;
@@ -546,6 +551,10 @@ async fn query_day(
             println!("mean: {:.1}F", celsius_to_fahrenheit(mean));
         }
         println!("observed hours: {}", profile.observed_hour_count);
+        println!(
+            "quality state: {}",
+            output["quality_state"].as_str().unwrap_or_default()
+        );
         if let Some(sources) = output["sources"].as_array() {
             let sources = sources
                 .iter()
@@ -558,6 +567,9 @@ async fn query_day(
         }
         if let Some(freshness_note) = output["freshness_note"].as_str() {
             println!("freshness: {freshness_note}");
+        }
+        if let Some(quality_note) = output["quality_note"].as_str() {
+            println!("quality: {quality_note}");
         }
     }
     Ok(())
@@ -585,17 +597,22 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         as_of_hour,
     );
     let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
+    let quality_note = target_profile.as_ref().and_then(|profile| {
+        quality_note_for_day(profile.observed_hour_count, &profile.source_slugs)
+    });
 
     if format == OutputFormat::Json {
         let output = json!({
             "breakdown": breakdown,
             "freshness_note": freshness_note,
+            "quality_note": quality_note,
         });
         print_json(&output)?;
     } else {
         println!("station: {}", breakdown.station_id);
         println!("date: {}", breakdown.target_date);
         println!("threshold high: {:.1}F", args.threshold_high);
+        println!("quality state: {}", breakdown.quality_state);
         for method in &breakdown.methods {
             println!(
                 "{}: {:.1}% (n={}){}{}{}",
@@ -637,6 +654,9 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         if let Some(freshness_note) = freshness_note {
             println!("freshness: {freshness_note}");
         }
+        if let Some(quality_note) = quality_note {
+            println!("quality: {quality_note}");
+        }
     }
     Ok(())
 }
@@ -664,11 +684,30 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
         args.top,
     );
     let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
+    let quality_state = probability_quality_state(
+        target_date,
+        Some(&target_profile),
+        &daily,
+        &profiles,
+        as_of_hour,
+    );
+    let quality_note = quality_note_for_day(
+        target_profile.observed_hour_count,
+        &target_profile.source_slugs,
+    );
     let status_note = if analogs.is_empty() {
-        Some(format!(
-            "no comparable analogs found for target profile with {} observed hours",
-            target_profile.observed_hour_count
-        ))
+        if target_profile.observed_hour_count < minimum_analog_hours(as_of_hour) {
+            Some(format!(
+                "insufficient observed hours for analog search: {} observed, {} required",
+                target_profile.observed_hour_count,
+                minimum_analog_hours(as_of_hour)
+            ))
+        } else {
+            Some(format!(
+                "no comparable analogs found for target profile with {} observed hours",
+                target_profile.observed_hour_count
+            ))
+        }
     } else {
         None
     };
@@ -679,6 +718,8 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
             "freshness_note": freshness_note,
             "status_note": status_note,
             "target_observed_hours": target_profile.observed_hour_count,
+            "quality_state": quality_state,
+            "quality_note": quality_note,
         });
         print_json(&output)?;
     } else {
@@ -689,8 +730,12 @@ async fn query_analogs(format: OutputFormat, app: &App, args: AnalogsArgs) -> Re
             "target observed hours: {}",
             target_profile.observed_hour_count
         );
+        println!("quality state: {quality_state}");
         if let Some(freshness_note) = freshness_note {
             println!("freshness: {freshness_note}");
+        }
+        if let Some(quality_note) = quality_note {
+            println!("quality: {quality_note}");
         }
         if let Some(status_note) = status_note {
             println!("status: {status_note}");
@@ -1661,8 +1706,7 @@ fn normalized_manifest_warnings(
             .any(|flag| matches!(flag, crate::domain::QualityFlag::SourceFieldMissing(_)))
     }) {
         warnings.push(
-            "some normalized fields were unavailable or unsupported in the source payload"
-                .to_owned(),
+            "one or more optional normalized fields were limited by source availability or parser coverage".to_owned(),
         );
     }
     warnings
@@ -1704,6 +1748,31 @@ fn current_day_freshness_note(
             "latest NWS observation age: {minutes} minutes ({latest})"
         )))
     }
+}
+
+fn quality_state_for_day(observed_hours: usize, source_slugs: &[String]) -> String {
+    if observed_hours < minimum_analog_hours(None) {
+        "sparse-current-day".to_owned()
+    } else if source_slugs.iter().any(|slug| slug == "ghcnh") {
+        "mixed-cadence".to_owned()
+    } else {
+        "normal".to_owned()
+    }
+}
+
+fn quality_note_for_day(observed_hours: usize, source_slugs: &[String]) -> Option<String> {
+    if source_slugs.len() == 1 && source_slugs.first().is_some_and(|slug| slug == "nws-api") {
+        return Some(
+            "low-history / partial-day target currently relies only on NWS API observations"
+                .to_owned(),
+        );
+    }
+    if observed_hours < minimum_analog_hours(None) {
+        return Some(format!(
+            "partial-day target has only {observed_hours} observed hours"
+        ));
+    }
+    None
 }
 
 fn source_role(source: DataSource) -> &'static str {
@@ -1824,6 +1893,70 @@ fn station_normalized_manifests_for_source(
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+
+    use crate::domain::{ObservationRecord, StationId};
+    use crate::source::DataSource;
+
+    use super::{normalized_manifest_warnings, quality_note_for_day, quality_state_for_day};
+
+    fn observation(source: DataSource) -> ObservationRecord {
+        let offset = FixedOffset::west_opt(6 * 3600).unwrap();
+        let naive = NaiveDateTime::parse_from_str("2026-05-14 00:00", "%Y-%m-%d %H:%M").unwrap();
+        let dt = offset.from_local_datetime(&naive).single().unwrap();
+        ObservationRecord::from_parts(
+            StationId::new("KDSM"),
+            source,
+            "KDSM".to_owned(),
+            dt,
+            "raw".to_owned(),
+        )
+    }
+
+    #[test]
+    fn query_quality_helpers_mark_sparse_and_low_history_days() {
+        assert_eq!(
+            quality_state_for_day(1, &["nws-api".to_owned()]),
+            "sparse-current-day"
+        );
+        assert_eq!(
+            quality_note_for_day(1, &["nws-api".to_owned()]).as_deref(),
+            Some("low-history / partial-day target currently relies only on NWS API observations")
+        );
+        assert_eq!(
+            quality_state_for_day(12, &["ghcnh".to_owned()]),
+            "mixed-cadence"
+        );
+        assert_eq!(
+            quality_state_for_day(12, &["iem-asos-1min".to_owned()]),
+            "normal"
+        );
+    }
+
+    #[test]
+    fn manifest_warnings_distinguish_cadence_and_field_coverage() {
+        let mut ghcnh = observation(DataSource::Ghcnh);
+        ghcnh
+            .quality_flags
+            .push(crate::domain::QualityFlag::SourceFieldMissing(
+                "relative_humidity".to_owned(),
+            ));
+        let warnings = normalized_manifest_warnings(DataSource::Ghcnh, &[ghcnh]);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("hourly fallback cadence"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("source availability or parser coverage"))
+        );
+    }
+}
+
 struct PathLock {
     path: PathBuf,
 }
@@ -1842,6 +1975,10 @@ fn acquire_path_lock(target: &Path) -> Result<PathLock> {
             .and_then(|value| value.to_str())
             .unwrap_or("artifact")
     ));
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create lock parent {}", parent.display()))?;
+    }
     for _ in 0..200 {
         match fs::OpenOptions::new()
             .write(true)

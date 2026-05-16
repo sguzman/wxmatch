@@ -127,6 +127,7 @@ cargo run -- query prob KDSM --date 2026-05-14 --threshold-high 75
 cargo run -- query prob KDSM --today --threshold-high 80 --format json
 cargo run -- fetch current KDSM
 cargo run -- query analogs KDSM --date 2026-05-14 --top 10
+cargo run -- query analogs KDEN --today --top 3 --format json
 cargo run -- query duckdb-paths --station KDSM --year 2026
 ```
 
@@ -148,7 +149,7 @@ Current fixed weights:
 - partial-profile analogs: `0.30`
 - nearest-neighbor analogs: `0.25`
 
-The combined result renormalizes across only the methods that are actually available for the target day. Output also includes unavailable methods, cadence warnings, and current-day freshness notes when applicable.
+The combined result renormalizes across only the methods that are actually available for the target day. Output also includes unavailable methods, `quality_state`, cadence warnings, low-history notes, and current-day freshness notes when applicable.
 
 ## Logging
 
@@ -194,6 +195,7 @@ cargo run -- query duckdb-paths --station KDSM --year 2026
 
 - The IEM path still targets the fields reliably exposed by the 1-minute endpoint: temperature, dew point, wind direction, wind speed, and pressure.
 - The IEM adapter now also captures stable precipitation, visibility, and primary cloud-code fields when the export exposes them.
+- When the richer IEM optional-field request is rejected for a station, `wxmatch` automatically retries the fetch with the core field set instead of failing the station outright.
 - The NCEI 5-minute adapter parses METAR-style tokens from the NOAA archive and currently emphasizes temperature, dew point, wind, gust, visibility, precip tokens, cloud layers, and altimeter-derived pressure.
 - The GHCNh adapter normalizes the stable hourly fields exposed by the PSV export and acts as a lower-resolution fallback.
 - Relative humidity is derived during normalization when temperature and dew point are present.
@@ -201,6 +203,7 @@ cargo run -- query duckdb-paths --station KDSM --year 2026
 - Analog matching is same-station only and prefers same-cadence candidates before mixed-cadence fallback days.
 - Any analog or probability result that includes `GHCNh` fallback data is marked as mixed-cadence / lower-confidence in both text and JSON output.
 - Current-day queries automatically refresh the latest NWS observation, merge it into the yearly Parquet dataset, and report freshness or stale-data notes.
+- Sparse current-day queries now report explicit unavailability reasons when trajectory or analog methods do not yet have enough observed hours to run.
 
 ## Project Plan
 

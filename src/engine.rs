@@ -7,6 +7,10 @@ use crate::domain::{
 use anyhow::{Result, bail};
 use chrono::{Datelike, Local, NaiveDate, Timelike};
 
+const TRAJECTORY_MIN_TEMP_HOURS: usize = 2;
+const PARTIAL_ANALOG_MIN_HOURS: usize = 2;
+const FULL_ANALOG_MIN_HOURS: usize = 6;
+
 pub trait Normalizer {
     fn normalize(&self) -> Result<Vec<ObservationRecord>>;
 }
@@ -283,6 +287,16 @@ impl ProbabilityMethod for TrajectoryMethod {
             });
         };
 
+        let observed_temp_hours = observed_temperature_hours(target_profile, as_of_hour);
+        if observed_temp_hours < TRAJECTORY_MIN_TEMP_HOURS {
+            return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+                method: self.name().to_owned(),
+                reason: format!(
+                    "target profile has only {observed_temp_hours} observed temperature hours; method requires at least {TRAJECTORY_MIN_TEMP_HOURS}"
+                ),
+            });
+        }
+
         let limit_hour =
             as_of_hour.unwrap_or_else(|| latest_observed_hour(target_profile).unwrap_or(23));
         let Some((target_temp, target_slope)) =
@@ -395,6 +409,9 @@ pub fn build_probability_breakdown(
         ProbabilityMethodOutcome::Unavailable(unavailable) => unavailable_methods.push(unavailable),
     }
 
+    let quality_state =
+        probability_quality_state(target_date, target_profile, daily, profiles, as_of_hour);
+
     let combined = if estimates.len() >= 2 {
         let weights_sum = estimates
             .iter()
@@ -420,6 +437,7 @@ pub fn build_probability_breakdown(
         station_id,
         target_date,
         threshold_high_c,
+        quality_state,
         methods: estimates,
         unavailable_methods,
         combined,
@@ -498,6 +516,16 @@ fn analog_probability_estimate(
             reason: "no target profile is available".to_owned(),
         });
     };
+    let min_required = minimum_analog_hours(as_of_hour);
+    if target_profile.observed_hour_count < min_required {
+        return ProbabilityMethodOutcome::Unavailable(MethodAvailability {
+            method: analog_method_name(as_of_hour).to_owned(),
+            reason: format!(
+                "target profile has only {} observed hours; method requires at least {min_required}",
+                target_profile.observed_hour_count
+            ),
+        });
+    }
     let analogs = top_analogs(
         station_id,
         target_date,
@@ -580,6 +608,54 @@ fn profile_distance(
     }
 
     Some((total / count as f64, count))
+}
+
+pub fn probability_quality_state(
+    target_date: NaiveDate,
+    target_profile: Option<&DayProfile>,
+    daily: &[DailySummary],
+    profiles: &[DayProfile],
+    as_of_hour: Option<u8>,
+) -> String {
+    let Some(target_profile) = target_profile else {
+        return "normal".to_owned();
+    };
+    if target_profile.observed_hour_count < minimum_analog_hours(as_of_hour) {
+        return "sparse-current-day".to_owned();
+    }
+    let mixed = top_analogs(
+        &target_profile.station_id,
+        target_date,
+        daily,
+        profiles,
+        target_profile,
+        as_of_hour,
+        30,
+    )
+    .iter()
+    .any(|analog| analog.source_mix_note.is_some());
+    if mixed {
+        "mixed-cadence".to_owned()
+    } else {
+        "normal".to_owned()
+    }
+}
+
+pub fn minimum_analog_hours(as_of_hour: Option<u8>) -> usize {
+    if as_of_hour.is_some() {
+        PARTIAL_ANALOG_MIN_HOURS
+    } else {
+        FULL_ANALOG_MIN_HOURS
+    }
+}
+
+pub fn observed_temperature_hours(profile: &DayProfile, as_of_hour: Option<u8>) -> usize {
+    profile
+        .hours
+        .iter()
+        .filter(|hour| as_of_hour.is_none_or(|limit| hour.hour <= limit))
+        .filter(|hour| hour.sample_count > 0 && hour.temperature_c.is_some())
+        .count()
 }
 
 fn analog_method_name(as_of_hour: Option<u8>) -> &'static str {
@@ -743,7 +819,7 @@ mod tests {
     use super::{
         ClimatologyMethod, DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder,
         ProbabilityMethod, TrajectoryMethod, build_probability_breakdown, dedupe_observations,
-        top_analogs,
+        observed_temperature_hours, probability_quality_state, top_analogs,
     };
 
     fn observation(station: &str, date: &str, temp: f64) -> ObservationRecord {
@@ -943,6 +1019,8 @@ mod tests {
                 .iter()
                 .any(|method| method.method == "temperature-trajectory")
         );
+        assert_eq!(breakdown.methods.len(), 1);
+        assert_eq!(breakdown.methods[0].method, "seasonal-climatology");
         assert!(breakdown.combined.is_none());
     }
 
@@ -1022,5 +1100,124 @@ mod tests {
                 panic!("trajectory method unexpectedly unavailable: {reason:?}")
             }
         }
+    }
+
+    #[test]
+    fn sparse_target_profile_marks_probability_quality_state() {
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 20.0),
+            observation("KDSM", "2025-05-14 00:00", 21.0),
+            observation("KDSM", "2026-05-14 00:00", 22.0),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+        assert_eq!(observed_temperature_hours(target_profile, None), 1);
+        let breakdown = build_probability_breakdown(
+            StationId::new("KDSM"),
+            target_date,
+            24.0,
+            &daily,
+            &profiles,
+            Some(target_profile),
+            None,
+        );
+        assert_eq!(breakdown.quality_state, "sparse-current-day");
+        assert!(
+            breakdown
+                .unavailable_methods
+                .iter()
+                .any(|method| method.reason.contains("requires at least 6"))
+        );
+    }
+
+    #[test]
+    fn mixed_cadence_candidate_pool_marks_quality_state() {
+        let mut ghcnh = observation("KDSM", "2025-05-14 00:00", 20.0);
+        ghcnh.source = DataSource::Ghcnh;
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 20.0),
+            observation("KDSM", "2024-05-14 01:00", 21.0),
+            ghcnh,
+            {
+                let mut obs = observation("KDSM", "2025-05-14 01:00", 21.0);
+                obs.source = DataSource::Ghcnh;
+                obs
+            },
+            observation("KDSM", "2026-05-14 00:00", 20.0),
+            observation("KDSM", "2026-05-14 01:00", 21.0),
+            observation("KDSM", "2026-05-14 02:00", 22.0),
+            observation("KDSM", "2026-05-14 03:00", 23.0),
+            observation("KDSM", "2026-05-14 04:00", 24.0),
+            observation("KDSM", "2026-05-14 05:00", 25.0),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+        assert_eq!(
+            probability_quality_state(
+                target_date,
+                Some(target_profile),
+                &daily,
+                &profiles,
+                Some(1)
+            ),
+            "mixed-cadence"
+        );
+    }
+
+    #[test]
+    fn climatology_and_trajectory_can_combine_without_full_day_analogs() {
+        let observations = vec![
+            observation("KDSM", "2024-05-14 00:00", 20.0),
+            observation("KDSM", "2024-05-14 01:00", 24.0),
+            observation("KDSM", "2025-05-14 00:00", 21.0),
+            observation("KDSM", "2025-05-14 01:00", 25.0),
+            observation("KDSM", "2026-05-14 00:00", 20.5),
+            observation("KDSM", "2026-05-14 01:00", 24.5),
+        ];
+        let daily = DailySummaryBuilder.build(&observations).unwrap();
+        let profiles = DayProfileBuilder.build(&observations).unwrap();
+        let target_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let target_profile = profiles
+            .iter()
+            .find(|profile| profile.local_date == target_date)
+            .unwrap();
+        let breakdown = build_probability_breakdown(
+            StationId::new("KDSM"),
+            target_date,
+            23.0,
+            &daily,
+            &profiles,
+            Some(target_profile),
+            None,
+        );
+        assert!(
+            breakdown
+                .methods
+                .iter()
+                .any(|method| method.method == "seasonal-climatology")
+        );
+        assert!(
+            breakdown
+                .methods
+                .iter()
+                .any(|method| method.method == "temperature-trajectory")
+        );
+        assert!(
+            breakdown
+                .unavailable_methods
+                .iter()
+                .any(|method| method.method == "nearest-neighbor-analogs")
+        );
+        assert!(breakdown.combined.is_some());
     }
 }

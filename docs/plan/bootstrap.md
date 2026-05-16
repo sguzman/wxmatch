@@ -133,6 +133,7 @@ Rules:
   - `temperature-trajectory`
   - `partial-profile-analogs`
   - `nearest-neighbor-analogs`
+- query outputs carry `quality_state` plus freshness/status notes where applicable
 - `query analogs`: same-station nearest-neighbor analog search over hourly profiles with same-cadence preference
 - `source list`, `station inspect`, and `cache manifests`: cache/source/provenance inspection in text or JSON
 - `query duckdb-paths`: prints normalized/derived Parquet locations and example DuckDB commands
@@ -148,6 +149,7 @@ Rules:
 - Weights are renormalized across the available methods only.
 - Current-day output includes a freshness or stale-data note based on the newest same-day NWS observation.
 - Mixed-cadence candidate pools are explicitly marked when `GHCNh` contributes.
+- Sparse current-day target profiles surface explicit unavailability reasons instead of silently omitting methods.
 
 ## Validation Rules
 
@@ -161,6 +163,7 @@ Rules:
 - partial-day analogs require at least 2 matched hours
 - full-profile analogs require at least 6 matched hours
 - same-cadence analog candidates rank ahead of mixed-cadence fallback candidates
+- if the richer IEM optional-field request is rejected, the adapter retries with the core field set
 
 ## Acceptance Criteria
 

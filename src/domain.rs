@@ -184,6 +184,7 @@ pub struct ProbabilityBreakdown {
     pub station_id: StationId,
     pub target_date: NaiveDate,
     pub threshold_high_c: f64,
+    pub quality_state: String,
     pub methods: Vec<ProbabilityEstimate>,
     pub unavailable_methods: Vec<MethodAvailability>,
     pub combined: Option<CombinedProbability>,

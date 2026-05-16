@@ -100,10 +100,17 @@ impl IemAsosOneMinuteAdapter {
         timezone: &str,
         start: NaiveDate,
         end: NaiveDate,
+        include_optional_fields: bool,
     ) -> String {
+        let optional = if include_optional_fields {
+            "&vars=p01i&vars=vsby&vars=skyc1"
+        } else {
+            ""
+        };
         format!(
-            "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py?station={station}&vars=tmpf&vars=dwpf&vars=drct&vars=sknt&vars=pres1&vars=p01i&vars=vsby&vars=skyc1&year1={year1}&month1={month1}&day1={day1}&hour1=0&minute1=0&year2={year2}&month2={month2}&day2={day2}&hour2=23&minute2=59&what=download&tz={timezone}",
+            "https://mesonet.agron.iastate.edu/cgi-bin/request/asos1min.py?station={station}&vars=tmpf&vars=dwpf&vars=drct&vars=sknt&vars=pres1{optional}&year1={year1}&month1={month1}&day1={day1}&hour1=0&minute1=0&year2={year2}&month2={month2}&day2={day2}&hour2=23&minute2=59&what=download&tz={timezone}",
             station = station_id.as_iem_id(),
+            optional = optional,
             year1 = start.format("%Y"),
             month1 = start.format("%m"),
             day1 = start.format("%d"),
@@ -149,14 +156,30 @@ impl WeatherSourceAdapter for IemAsosOneMinuteAdapter {
             });
         }
 
-        let url = self.request_url(station_id, &station.timezone, start, end);
-        info!(station = %station_id, %url, "downloading historical observations");
-        let body = self
+        let rich_url = self.request_url(station_id, &station.timezone, start, end, true);
+        info!(station = %station_id, url = %rich_url, "downloading historical observations");
+        let initial = self
             .http
-            .get(&url)
+            .get(&rich_url)
             .send()
             .await
-            .context("failed to request IEM historical data")?
+            .context("failed to request IEM historical data")?;
+        let response = if initial.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let fallback_url = self.request_url(station_id, &station.timezone, start, end, false);
+            info!(
+                station = %station_id,
+                url = %fallback_url,
+                "IEM optional field request was rejected; retrying with core field set"
+            );
+            self.http
+                .get(&fallback_url)
+                .send()
+                .await
+                .context("failed to request fallback IEM historical data")?
+        } else {
+            initial
+        };
+        let body = response
             .error_for_status()
             .context("IEM historical request failed")?
             .text()
