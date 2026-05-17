@@ -451,6 +451,36 @@ fn latest_observed_hour_local(profile: &DayProfile) -> Option<u8> {
         .map(|hour| hour.hour)
 }
 
+fn effective_as_of_hour(
+    target_date: NaiveDate,
+    requested_as_of: Option<chrono::NaiveTime>,
+    target_profile: Option<&DayProfile>,
+) -> Option<u8> {
+    if let Some(as_of) = requested_as_of {
+        return Some(as_of.hour() as u8);
+    }
+    if target_date == Local::now().date_naive() {
+        return target_profile.and_then(latest_observed_hour_local);
+    }
+    None
+}
+
+fn effective_as_of_label(
+    target_date: NaiveDate,
+    requested_as_of: Option<chrono::NaiveTime>,
+    target_profile: Option<&DayProfile>,
+) -> Option<String> {
+    if let Some(as_of) = requested_as_of {
+        return Some(as_of.format("%H:%M").to_string());
+    }
+    if target_date == Local::now().date_naive() {
+        return target_profile
+            .and_then(latest_observed_hour_local)
+            .map(|hour| format!("{hour:02}:00"));
+    }
+    None
+}
+
 fn seasonal_distance(left_ordinal: i32, right_ordinal: i32) -> i32 {
     let raw = (left_ordinal - right_ordinal).abs();
     raw.min(366 - raw)
@@ -992,7 +1022,8 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
     let daily = load_all_daily(app, &station_id)?;
     let profiles = load_all_profiles(app, &station_id)?;
     let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
-    let as_of_hour = args.as_of.map(|time| time.hour() as u8);
+    let as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
+    let as_of_label = effective_as_of_label(target_date, args.as_of, target_profile.as_ref());
     let breakdown = build_probability_breakdown(
         station_id.clone(),
         target_date,
@@ -1022,6 +1053,7 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
     if format == OutputFormat::Json {
         let output = json!({
             "breakdown": breakdown,
+            "as_of": as_of_label,
             "freshness_note": freshness_note,
             "quality_note": quality_note,
         });
@@ -1030,6 +1062,9 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         println!("station: {}", breakdown.station_id);
         println!("date: {}", breakdown.target_date);
         println!("threshold high: {:.1}F", args.threshold_high);
+        if let Some(as_of_label) = &as_of_label {
+            println!("as-of: {as_of_label}");
+        }
         println!("quality state: {}", breakdown.quality_state);
         for method in &breakdown.methods {
             println!(
@@ -1094,7 +1129,8 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
     let daily = load_all_daily(app, &station_id)?;
     let profiles = load_all_profiles(app, &station_id)?;
     let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
-    let as_of_hour = args.as_of.map(|time| time.hour() as u8);
+    let as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
+    let as_of_label = effective_as_of_label(target_date, args.as_of, target_profile.as_ref());
     let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
     let quality_note = target_profile
         .as_ref()
@@ -1223,7 +1259,7 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
     let output = json!({
         "station": station_id.to_string(),
         "date": target_date,
-        "as_of": args.as_of.map(|value| value.format("%H:%M").to_string()),
+        "as_of": as_of_label,
         "min_high_f": args.min_high,
         "max_high_f": args.max_high,
         "top_n": args.top,
