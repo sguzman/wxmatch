@@ -186,6 +186,7 @@ pub enum QuerySubcommand {
         station: String,
     },
     Prob(ProbabilityArgs),
+    LikelyHigh(LikelyHighArgs),
     Analogs(AnalogsArgs),
     Hypothesis(HypothesisArgs),
     DuckdbPaths {
@@ -211,6 +212,29 @@ pub struct ProbabilityArgs {
 
     #[arg(long)]
     pub as_of: Option<NaiveTime>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LikelyHighArgs {
+    pub station: String,
+
+    #[arg(long, conflicts_with = "today")]
+    pub date: Option<NaiveDate>,
+
+    #[arg(long, default_value_t = false)]
+    pub today: bool,
+
+    #[arg(long)]
+    pub as_of: Option<NaiveTime>,
+
+    #[arg(long, default_value_t = 40)]
+    pub min_high: i32,
+
+    #[arg(long, default_value_t = 100)]
+    pub max_high: i32,
+
+    #[arg(long, default_value_t = 5)]
+    pub top: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -277,6 +301,37 @@ mod tests {
                     assert_eq!(args.station, "KDEN");
                     assert!(args.today);
                     assert_eq!(args.threshold_high, 77.5);
+                }
+                other => panic!("unexpected subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_likely_high_query() {
+        let cli = Cli::parse_from([
+            "wxmatch",
+            "query",
+            "likely-high",
+            "KLAX",
+            "--today",
+            "--min-high",
+            "55",
+            "--max-high",
+            "85",
+            "--top",
+            "7",
+        ]);
+
+        match cli.command {
+            Command::Query(query) => match query.command {
+                QuerySubcommand::LikelyHigh(args) => {
+                    assert_eq!(args.station, "KLAX");
+                    assert!(args.today);
+                    assert_eq!(args.min_high, 55);
+                    assert_eq!(args.max_high, 85);
+                    assert_eq!(args.top, 7);
                 }
                 other => panic!("unexpected subcommand: {other:?}"),
             },

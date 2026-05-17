@@ -15,8 +15,8 @@ use crate::cache::CacheLayout;
 use crate::cli::{
     AnalogsArgs, BuildCommand, BuildSubcommand, CacheCommand, CacheSubcommand, Cli, Command,
     FetchCommand, FetchCurrentArgs, FetchStationArgs, HypothesisArgs, NormalizeCommand,
-    NormalizeSubcommand, OutputFormat, ProbabilityArgs, QueryCommand, QuerySubcommand,
-    SourceCommand, SourceSubcommand, StationCommand, StationSubcommand,
+    LikelyHighArgs, NormalizeSubcommand, OutputFormat, ProbabilityArgs, QueryCommand,
+    QuerySubcommand, SourceCommand, SourceSubcommand, StationCommand, StationSubcommand,
 };
 use crate::domain::{
     DailySummary, DailySummaryRow, DatasetManifest, DayProfile, DayProfileRow, ObservationRecord,
@@ -110,6 +110,90 @@ fn print_json_or_text(format: OutputFormat, output: &serde_json::Value) -> Resul
         println!("status: {status_note}");
     }
     Ok(())
+}
+
+fn distribution_from_survival(survival: &[(i32, f64)]) -> Vec<(i32, f64)> {
+    if survival.is_empty() {
+        return Vec::new();
+    }
+
+    let mut values = survival.to_vec();
+    values.sort_by_key(|(threshold, _)| *threshold);
+    let mut distribution = Vec::new();
+    for window in values.windows(2) {
+        let (threshold, probability) = window[0];
+        let next_probability = window[1].1;
+        distribution.push((threshold, (probability - next_probability).max(0.0)));
+    }
+    if let Some((threshold, probability)) = values.last().copied() {
+        distribution.push((threshold, probability.max(0.0)));
+    }
+    distribution
+}
+
+fn exact_distribution_and_tail(distribution: &[(i32, f64)]) -> (Vec<(i32, f64)>, f64) {
+    if distribution.is_empty() {
+        return (Vec::new(), 0.0);
+    }
+    let mut exact = distribution.to_vec();
+    let tail = exact.pop().map(|(_, probability)| probability).unwrap_or(0.0);
+    (exact, tail)
+}
+
+fn mode_temperature(distribution: &[(i32, f64)]) -> Option<i64> {
+    distribution
+        .iter()
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(temperature, _)| i64::from(*temperature))
+}
+
+fn expected_temperature(distribution: &[(i32, f64)]) -> Option<f64> {
+    let total = distribution.iter().map(|(_, probability)| *probability).sum::<f64>();
+    if total <= f64::EPSILON {
+        return None;
+    }
+    Some(
+        distribution
+            .iter()
+            .map(|(temperature, probability)| f64::from(*temperature) * probability)
+            .sum::<f64>()
+            / total,
+    )
+}
+
+fn top_targets(distribution: &[(i32, f64)], top_n: usize) -> Vec<serde_json::Value> {
+    let mut targets = distribution.to_vec();
+    targets.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    targets
+        .into_iter()
+        .take(top_n)
+        .map(|(temperature, probability)| {
+            json!({
+                "target_high_f": temperature,
+                "probability": probability,
+            })
+        })
+        .collect()
+}
+
+fn tail_probability(distribution: &[(i32, f64)]) -> f64 {
+    distribution.last().map(|(_, probability)| *probability).unwrap_or(0.0)
+}
+
+fn summarize_distribution(distribution: &[(i32, f64)], top_n: usize) -> serde_json::Value {
+    let (exact, tail) = exact_distribution_and_tail(distribution);
+    json!({
+        "most_likely_high_f": mode_temperature(&exact),
+        "expected_high_f": expected_temperature(&exact),
+        "top_targets": top_targets(&exact, top_n),
+        "tail_above_max_probability": tail,
+    })
+}
+
+fn format_optional_temperature(value: Option<i64>) -> String {
+    value
+        .map(|value| format!("{value}F"))
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 #[instrument(skip(app))]
@@ -400,6 +484,7 @@ async fn handle_query(format: OutputFormat, app: &App, command: QueryCommand) ->
             .await
         }
         QuerySubcommand::Prob(args) => query_probability(format, app, args).await,
+        QuerySubcommand::LikelyHigh(args) => query_likely_high(format, app, args).await,
         QuerySubcommand::Analogs(args) => query_analogs(format, app, args).await,
         QuerySubcommand::Hypothesis(args) => query_hypothesis(format, app, args).await,
         QuerySubcommand::DuckdbPaths { station, year } => {
@@ -719,6 +804,159 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
             println!("quality: {quality_note}");
         }
     }
+    Ok(())
+}
+
+#[instrument(skip(app))]
+async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs) -> Result<()> {
+    if args.max_high < args.min_high {
+        bail!("--max-high must be greater than or equal to --min-high");
+    }
+
+    let target_date = target_date_or_today(args.date, args.today)?;
+    let station_id = StationId::new(&args.station);
+    if target_date == Local::now().date_naive() {
+        ensure_today_current_data(app, &station_id).await?;
+    }
+    ensure_derived(app, &station_id, target_date.year()).await?;
+    let daily = load_all_daily(app, &station_id)?;
+    let profiles = load_all_profiles(app, &station_id)?;
+    let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    let as_of_hour = args.as_of.map(|time| time.hour() as u8);
+    let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
+    let quality_note = target_profile
+        .as_ref()
+        .and_then(|profile| quality_note_for_day(profile.observed_hour_count, &profile.source_slugs));
+    let thresholds = (args.min_high..=args.max_high + 1).collect::<Vec<_>>();
+
+    let mut combined_survival = Vec::new();
+    let mut method_survival: BTreeMap<String, Vec<(i32, f64)>> = BTreeMap::new();
+    let mut display_breakdown = None;
+
+    for threshold_f in &thresholds {
+        let breakdown = build_probability_breakdown(
+            station_id.clone(),
+            target_date,
+            fahrenheit_to_celsius(f64::from(*threshold_f)),
+            &daily,
+            &profiles,
+            target_profile.as_ref(),
+            as_of_hour,
+        );
+        for method in &breakdown.methods {
+            method_survival
+                .entry(method.method.clone())
+                .or_default()
+                .push((*threshold_f, method.probability));
+        }
+        if let Some(probability) = breakdown.combined_probability {
+            combined_survival.push((*threshold_f, probability));
+        }
+        if *threshold_f == args.max_high {
+            display_breakdown = Some(breakdown);
+        }
+    }
+
+    let combined_distribution = distribution_from_survival(&combined_survival);
+    let method_distributions = method_survival
+        .iter()
+        .map(|(method, survival)| {
+            (
+                method.clone(),
+                distribution_from_survival(survival),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let combined_summary = summarize_distribution(&combined_distribution, args.top);
+    let method_summaries = method_distributions
+        .iter()
+        .map(|(method, distribution)| {
+            json!({
+                "method": method,
+                "most_likely_high_f": mode_temperature(distribution),
+                "expected_high_f": expected_temperature(distribution),
+                "top_targets": top_targets(distribution, args.top),
+                "tail_above_max_probability": tail_probability(distribution),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let output = json!({
+        "station": station_id.to_string(),
+        "date": target_date,
+        "as_of": args.as_of.map(|value| value.format("%H:%M").to_string()),
+        "min_high_f": args.min_high,
+        "max_high_f": args.max_high,
+        "top_n": args.top,
+        "quality_state": display_breakdown.as_ref().map(|breakdown| breakdown.quality_state.clone()).unwrap_or_else(|| "normal".to_owned()),
+        "quality_note": quality_note,
+        "freshness_note": freshness_note,
+        "combined": {
+            "most_likely_high_f": combined_summary["most_likely_high_f"].clone(),
+            "expected_high_f": combined_summary["expected_high_f"].clone(),
+            "top_targets": combined_summary["top_targets"].clone(),
+            "tail_above_max_probability": combined_summary["tail_above_max_probability"].clone(),
+        },
+        "methods": method_summaries,
+        "latest_breakdown": display_breakdown,
+    });
+
+    if format == OutputFormat::Json {
+        print_json(&output)?;
+    } else {
+        println!("station: {station_id}");
+        println!("date: {target_date}");
+        println!("range: {}F..{}F", args.min_high, args.max_high);
+        if let Some(as_of) = output["as_of"].as_str() {
+            println!("as-of: {as_of}");
+        }
+        println!(
+            "quality state: {}",
+            output["quality_state"].as_str().unwrap_or_default()
+        );
+        if let Some(quality_note) = output["quality_note"].as_str() {
+            println!("quality: {quality_note}");
+        }
+        if let Some(freshness_note) = output["freshness_note"].as_str() {
+            println!("freshness: {freshness_note}");
+        }
+        println!(
+            "combined most likely high: {}",
+            format_optional_temperature(output["combined"]["most_likely_high_f"].as_i64())
+        );
+        if let Some(expected) = output["combined"]["expected_high_f"].as_f64() {
+            println!("combined expected high: {expected:.1}F");
+        }
+        if let Some(tail) = output["combined"]["tail_above_max_probability"].as_f64() {
+            println!("combined tail above max: {:.1}%", tail * 100.0);
+        }
+        println!("combined top targets:");
+        for target in output["combined"]["top_targets"].as_array().unwrap_or(&Vec::new()) {
+            println!(
+                "  {}F  {:.1}%",
+                target["target_high_f"].as_i64().unwrap_or_default(),
+                target["probability"].as_f64().unwrap_or_default() * 100.0
+            );
+        }
+        println!("methods:");
+        for method in output["methods"].as_array().unwrap_or(&Vec::new()) {
+            println!(
+                "  {} -> mode={} expected={} tail={:.1}%",
+                method["method"].as_str().unwrap_or_default(),
+                format_optional_temperature(method["most_likely_high_f"].as_i64()),
+                method["expected_high_f"]
+                    .as_f64()
+                    .map(|value| format!("{value:.1}F"))
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                method["tail_above_max_probability"]
+                    .as_f64()
+                    .unwrap_or_default()
+                    * 100.0
+            );
+        }
+    }
+
     Ok(())
 }
 
