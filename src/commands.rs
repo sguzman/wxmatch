@@ -19,8 +19,10 @@ use crate::cli::{
     QuerySubcommand, SourceCommand, SourceSubcommand, StationCommand, StationSubcommand,
 };
 use crate::domain::{
-    DailySummary, DailySummaryRow, DatasetManifest, DayProfile, DayProfileRow, ObservationRecord,
-    ObservationRow, SCHEMA_VERSION, StationId, celsius_to_fahrenheit, fahrenheit_to_celsius,
+    CombinedProbability, DailySummary, DailySummaryRow, DatasetManifest, DayProfile,
+    DayProfileRow, MethodAvailability, ObservationRecord, ObservationRow, ProbabilityBreakdown,
+    ProbabilityEstimate, SCHEMA_VERSION, StationId, celsius_to_fahrenheit,
+    fahrenheit_to_celsius,
 };
 use crate::engine::{
     DailySummaryBuilder, DayProfileBuilder, DerivedDatasetBuilder, build_probability_breakdown,
@@ -28,7 +30,7 @@ use crate::engine::{
     top_analogs,
 };
 use crate::source::{DataSource, SourceDescriptor, all_sources};
-use crate::sources::WeatherSourceAdapter;
+use crate::sources::{NwsHourlyForecastPeriod, WeatherSourceAdapter};
 use crate::storage::{list_files_recursive, read_json, read_parquet, write_json, write_parquet};
 
 pub async fn dispatch(app: &App, cli: Cli) -> Result<()> {
@@ -140,6 +142,243 @@ fn exact_distribution_and_tail(distribution: &[(i32, f64)]) -> (Vec<(i32, f64)>,
     (exact, tail)
 }
 
+fn hourly_forecast_distribution(
+    periods: &[NwsHourlyForecastPeriod],
+    target_date: NaiveDate,
+) -> Option<(Vec<(i32, f64)>, usize)> {
+    let mut forecast_high: Option<i32> = None;
+    let mut period_count = 0usize;
+    for period in periods {
+        let start = chrono::DateTime::parse_from_rfc3339(&period.start_time).ok()?;
+        if start.date_naive() != target_date {
+            continue;
+        }
+        period_count += 1;
+        let temperature_f = match period.temperature_unit.as_str() {
+            "F" => period.temperature,
+            "C" => celsius_to_fahrenheit(f64::from(period.temperature)).round() as i32,
+            _ => continue,
+        };
+        forecast_high = Some(forecast_high.map_or(temperature_f, |current| current.max(temperature_f)));
+    }
+    let forecast_high = forecast_high?;
+    let kernel = [
+        (forecast_high - 2, 0.10),
+        (forecast_high - 1, 0.20),
+        (forecast_high, 0.40),
+        (forecast_high + 1, 0.20),
+        (forecast_high + 2, 0.10),
+    ];
+    Some((kernel.into_iter().collect(), period_count))
+}
+
+fn empirical_high_distribution(
+    target_date: NaiveDate,
+    target_profile: &DayProfile,
+    daily: &[DailySummary],
+    profiles: &[DayProfile],
+    as_of_hour: Option<u8>,
+) -> Option<(Vec<(i32, f64)>, usize)> {
+    let limit_hour = as_of_hour.unwrap_or_else(|| latest_observed_hour_local(target_profile).unwrap_or(23));
+    let target_temp = target_profile
+        .hours
+        .iter()
+        .find(|hour| hour.hour == limit_hour)
+        .and_then(|hour| hour.temperature_c)?;
+    let daily_highs: BTreeMap<NaiveDate, f64> = daily
+        .iter()
+        .filter_map(|summary| summary.high_temp_c.map(|high| (summary.local_date, high)))
+        .collect();
+    let target_ordinal = target_date.ordinal() as i32;
+    let mut by_bucket: BTreeMap<i32, f64> = BTreeMap::new();
+    let mut total_weight = 0.0;
+    let mut sample_size = 0usize;
+    for profile in profiles.iter().filter(|profile| profile.local_date != target_date) {
+        let ordinal = profile.local_date.ordinal() as i32;
+        if seasonal_distance(target_ordinal, ordinal) > 45 {
+            continue;
+        }
+        let candidate_temp = profile
+            .hours
+            .iter()
+            .find(|hour| hour.hour == limit_hour)
+            .and_then(|hour| hour.temperature_c);
+        let Some(candidate_temp) = candidate_temp else {
+            continue;
+        };
+        let Some(high_c) = daily_highs.get(&profile.local_date).copied() else {
+            continue;
+        };
+        let weight = 1.0 / ((candidate_temp - target_temp).abs() + 0.5);
+        let bucket = celsius_to_fahrenheit(high_c).round() as i32;
+        *by_bucket.entry(bucket).or_insert(0.0) += weight;
+        total_weight += weight;
+        sample_size += 1;
+    }
+    if total_weight <= f64::EPSILON {
+        return None;
+    }
+    Some((
+        by_bucket
+            .into_iter()
+            .map(|(bucket, weight)| (bucket, weight / total_weight))
+            .collect(),
+        sample_size,
+    ))
+}
+
+fn blend_distributions(sources: &[(String, Vec<(i32, f64)>, f64)]) -> Vec<(i32, f64)> {
+    let mut totals: BTreeMap<i32, f64> = BTreeMap::new();
+    let weight_sum = sources.iter().map(|(_, _, weight)| *weight).sum::<f64>();
+    if weight_sum <= f64::EPSILON {
+        return Vec::new();
+    }
+    for (_, distribution, weight) in sources {
+        for (bucket, probability) in distribution {
+            *totals.entry(*bucket).or_insert(0.0) += probability * (*weight / weight_sum);
+        }
+    }
+    totals.into_iter().collect()
+}
+
+fn threshold_probability_from_distribution(
+    distribution: &[(i32, f64)],
+    threshold_high_f: i32,
+) -> Option<f64> {
+    if distribution.is_empty() {
+        return None;
+    }
+    Some(
+        distribution
+            .iter()
+            .filter(|(bucket, _)| *bucket >= threshold_high_f)
+            .map(|(_, probability)| *probability)
+            .sum::<f64>(),
+    )
+}
+
+fn recompute_combined_probability(breakdown: &mut ProbabilityBreakdown) {
+    if breakdown.methods.len() < 2 {
+        breakdown.combined = None;
+        breakdown.combined_probability = None;
+        return;
+    }
+
+    let weights_sum = breakdown
+        .methods
+        .iter()
+        .map(|estimate| estimate.weight_used.unwrap_or(0.0))
+        .sum::<f64>();
+    if weights_sum <= f64::EPSILON {
+        breakdown.combined = None;
+        breakdown.combined_probability = None;
+        return;
+    }
+
+    let probability = breakdown
+        .methods
+        .iter()
+        .map(|estimate| estimate.probability * estimate.weight_used.unwrap_or(0.0))
+        .sum::<f64>()
+        / weights_sum;
+    breakdown.combined = Some(CombinedProbability {
+        probability,
+        method_count: breakdown.methods.len(),
+        combination_note:
+            "fixed weighted blend across available methods with renormalized weights".to_owned(),
+    });
+    breakdown.combined_probability = Some(probability);
+}
+
+async fn enrich_probability_breakdown(
+    app: &App,
+    station_id: &StationId,
+    target_date: NaiveDate,
+    threshold_high_c: f64,
+    daily: &[DailySummary],
+    profiles: &[DayProfile],
+    target_profile: Option<&DayProfile>,
+    as_of_hour: Option<u8>,
+    mut breakdown: ProbabilityBreakdown,
+) -> Result<ProbabilityBreakdown> {
+    let threshold_high_f = celsius_to_fahrenheit(threshold_high_c).round() as i32;
+
+    match target_profile.and_then(|profile| {
+        empirical_high_distribution(target_date, profile, daily, profiles, as_of_hour)
+    }) {
+        Some((distribution, sample_size)) => {
+            if let Some(probability) =
+                threshold_probability_from_distribution(&distribution, threshold_high_f)
+            {
+                breakdown.methods.push(ProbabilityEstimate {
+                    method: "empirical-rise-model".to_owned(),
+                    probability,
+                    sample_size,
+                    weight_used: Some(0.25),
+                    confidence_note: Some(
+                        "same-hour seasonal analog of remaining rise to final daily high".to_owned(),
+                    ),
+                    note: Some(
+                        "historical days weighted by same-hour temperature similarity".to_owned(),
+                    ),
+                });
+            }
+        }
+        None => breakdown.unavailable_methods.push(MethodAvailability {
+            method: "empirical-rise-model".to_owned(),
+            reason: if target_profile.is_some() {
+                "no historical same-hour rise distribution was available".to_owned()
+            } else {
+                "no target profile is available".to_owned()
+            },
+        }),
+    }
+
+    if target_date == Local::now().date_naive() {
+        let station = app.sources.nws.fetch_station_metadata(station_id).await?;
+        let forecast = app.sources.nws.fetch_hourly_forecast(&station, false).await?;
+        let periods = app
+            .sources
+            .nws
+            .parse_hourly_forecast(Path::new(&forecast.path))?;
+        match hourly_forecast_distribution(&periods, target_date) {
+            Some((distribution, sample_size)) => {
+                if let Some(probability) =
+                    threshold_probability_from_distribution(&distribution, threshold_high_f)
+                {
+                    breakdown.methods.push(ProbabilityEstimate {
+                        method: "nws-hourly-forecast-guidance".to_owned(),
+                        probability,
+                        sample_size,
+                        weight_used: Some(0.35),
+                        confidence_note: Some(
+                            "NWS hourly forecast guidance converted to a daily-high distribution"
+                                .to_owned(),
+                        ),
+                        note: Some(
+                            "kernel centered on the highest forecast hourly temperature".to_owned(),
+                        ),
+                    });
+                }
+            }
+            None => breakdown.unavailable_methods.push(MethodAvailability {
+                method: "nws-hourly-forecast-guidance".to_owned(),
+                reason: "no hourly NWS forecast periods were available for the target date"
+                    .to_owned(),
+            }),
+        }
+    } else {
+        breakdown.unavailable_methods.push(MethodAvailability {
+            method: "nws-hourly-forecast-guidance".to_owned(),
+            reason: "hourly NWS forecast guidance is only available for current/future dates"
+                .to_owned(),
+        });
+    }
+
+    recompute_combined_probability(&mut breakdown);
+    Ok(breakdown)
+}
+
 fn mode_temperature(distribution: &[(i32, f64)]) -> Option<i64> {
     distribution
         .iter()
@@ -190,10 +429,31 @@ fn summarize_distribution(distribution: &[(i32, f64)], top_n: usize) -> serde_js
     })
 }
 
+fn combined_summary_for_distribution(
+    distribution: &[(i32, f64)],
+    top_n: usize,
+) -> serde_json::Value {
+    summarize_distribution(distribution, top_n)
+}
+
 fn format_optional_temperature(value: Option<i64>) -> String {
     value
         .map(|value| format!("{value}F"))
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn latest_observed_hour_local(profile: &DayProfile) -> Option<u8> {
+    profile
+        .hours
+        .iter()
+        .rev()
+        .find(|hour| hour.sample_count > 0 && hour.temperature_c.is_some())
+        .map(|hour| hour.hour)
+}
+
+fn seasonal_distance(left_ordinal: i32, right_ordinal: i32) -> i32 {
+    let raw = (left_ordinal - right_ordinal).abs();
+    raw.min(366 - raw)
 }
 
 #[instrument(skip(app))]
@@ -742,6 +1002,18 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         target_profile.as_ref(),
         as_of_hour,
     );
+    let breakdown = enrich_probability_breakdown(
+        app,
+        &station_id,
+        target_date,
+        crate::domain::fahrenheit_to_celsius(f64::from(args.threshold_high)),
+        &daily,
+        &profiles,
+        target_profile.as_ref(),
+        as_of_hour,
+        breakdown,
+    )
+    .await?;
     let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
     let quality_note = target_profile.as_ref().and_then(|profile| {
         quality_note_for_day(profile.observed_hour_count, &profile.source_slugs)
@@ -853,11 +1125,24 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
             combined_survival.push((*threshold_f, probability));
         }
         if *threshold_f == args.max_high {
-            display_breakdown = Some(breakdown);
+            display_breakdown = Some(
+                enrich_probability_breakdown(
+                    app,
+                    &station_id,
+                    target_date,
+                    fahrenheit_to_celsius(f64::from(*threshold_f)),
+                    &daily,
+                    &profiles,
+                    target_profile.as_ref(),
+                    as_of_hour,
+                    breakdown,
+                )
+                .await?,
+            );
         }
     }
 
-    let combined_distribution = distribution_from_survival(&combined_survival);
+    let legacy_combined_distribution = distribution_from_survival(&combined_survival);
     let method_distributions = method_survival
         .iter()
         .map(|(method, survival)| {
@@ -867,9 +1152,35 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let station = app.sources.nws.fetch_station_metadata(&station_id).await?;
+    let forecast_guidance = if target_date == Local::now().date_naive() {
+        let forecast = app.sources.nws.fetch_hourly_forecast(&station, false).await?;
+        let periods = app
+            .sources
+            .nws
+            .parse_hourly_forecast(Path::new(&forecast.path))?;
+        hourly_forecast_distribution(&periods, target_date).map(|(distribution, _)| distribution)
+    } else {
+        None
+    };
+    let empirical_distribution = target_profile
+        .as_ref()
+        .and_then(|profile| {
+            empirical_high_distribution(target_date, profile, &daily, &profiles, as_of_hour)
+                .map(|(distribution, _)| distribution)
+        });
+
+    let mut blend_sources = vec![("legacy-combined-threshold".to_owned(), legacy_combined_distribution.clone(), 0.40)];
+    if let Some(distribution) = empirical_distribution.clone() {
+        blend_sources.push(("empirical-rise-model".to_owned(), distribution, 0.25));
+    }
+    if let Some(distribution) = forecast_guidance.clone() {
+        blend_sources.push(("nws-hourly-forecast-guidance".to_owned(), distribution, 0.35));
+    }
+    let combined_distribution = blend_distributions(&blend_sources);
 
     let combined_summary = summarize_distribution(&combined_distribution, args.top);
-    let method_summaries = method_distributions
+    let mut method_summaries = method_distributions
         .iter()
         .map(|(method, distribution)| {
             json!({
@@ -881,6 +1192,33 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
             })
         })
         .collect::<Vec<_>>();
+    method_summaries.push(json!({
+        "method": "legacy-combined-threshold",
+        "most_likely_high_f": combined_summary_for_distribution(&legacy_combined_distribution, args.top)["most_likely_high_f"].clone(),
+        "expected_high_f": combined_summary_for_distribution(&legacy_combined_distribution, args.top)["expected_high_f"].clone(),
+        "top_targets": combined_summary_for_distribution(&legacy_combined_distribution, args.top)["top_targets"].clone(),
+        "tail_above_max_probability": combined_summary_for_distribution(&legacy_combined_distribution, args.top)["tail_above_max_probability"].clone(),
+    }));
+    if let Some(distribution) = empirical_distribution {
+        let summary = combined_summary_for_distribution(&distribution, args.top);
+        method_summaries.push(json!({
+            "method": "empirical-rise-model",
+            "most_likely_high_f": summary["most_likely_high_f"].clone(),
+            "expected_high_f": summary["expected_high_f"].clone(),
+            "top_targets": summary["top_targets"].clone(),
+            "tail_above_max_probability": summary["tail_above_max_probability"].clone(),
+        }));
+    }
+    if let Some(distribution) = forecast_guidance {
+        let summary = combined_summary_for_distribution(&distribution, args.top);
+        method_summaries.push(json!({
+            "method": "nws-hourly-forecast-guidance",
+            "most_likely_high_f": summary["most_likely_high_f"].clone(),
+            "expected_high_f": summary["expected_high_f"].clone(),
+            "top_targets": summary["top_targets"].clone(),
+            "tail_above_max_probability": summary["tail_above_max_probability"].clone(),
+        }));
+    }
 
     let output = json!({
         "station": station_id.to_string(),
@@ -1516,11 +1854,21 @@ async fn ensure_today_current_data(app: &App, station_id: &StationId) -> Result<
 
     info!(station = %station_id, date = %today, "refreshing current-day observation for today query");
     let station = app.sources.nws.fetch_station_metadata(station_id).await?;
-    let result = app.sources.nws.fetch_current(station_id, false).await?;
-    let normalized = app
+    let latest = app.sources.nws.fetch_current(station_id, false).await?;
+    let recent = app
         .sources
         .nws
-        .normalize_raw_file(Path::new(&result.path), &station)?;
+        .fetch_recent_observations(station_id, false)
+        .await?;
+    let mut normalized = app
+        .sources
+        .nws
+        .normalize_raw_file(Path::new(&latest.path), &station)?;
+    let mut recent_normalized = app
+        .sources
+        .nws
+        .normalize_raw_file(Path::new(&recent.path), &station)?;
+    normalized.append(&mut recent_normalized);
     let _lock = acquire_path_lock(&normalized_path)?;
     let added = merge_observations_into_year(&normalized_path, normalized)?;
     let existing_today_count = if normalized_path.exists() {

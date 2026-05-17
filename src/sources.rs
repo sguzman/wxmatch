@@ -334,8 +334,120 @@ impl NwsApiAdapter {
         )
     }
 
+    fn observations_url(station_id: &StationId, limit: usize) -> String {
+        format!(
+            "https://api.weather.gov/stations/{}/observations?limit={limit}",
+            station_id.as_nws_id()
+        )
+    }
+
+    fn points_url(latitude: f64, longitude: f64) -> String {
+        format!("https://api.weather.gov/points/{latitude:.4},{longitude:.4}")
+    }
+
     pub fn cached_station_path(&self, station_id: &StationId) -> std::path::PathBuf {
         self.cache.station_metadata_path(station_id)
+    }
+
+    pub async fn fetch_recent_observations(
+        &self,
+        station_id: &StationId,
+        refresh: bool,
+    ) -> Result<CurrentFetchResult> {
+        let station = self.fetch_station_metadata(station_id).await?;
+        let today = Utc::now().date_naive();
+        let path = self.cache.current_raw_path(
+            self.source(),
+            station_id,
+            today,
+            "obs-recent",
+            "json",
+        );
+        if path.exists() && !refresh {
+            let byte_count = fs::metadata(&path)?.len() as usize;
+            return Ok(CurrentFetchResult {
+                path: path.display().to_string(),
+                byte_count,
+                reused: true,
+            });
+        }
+        let url = Self::observations_url(station_id, 36);
+        let body = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("failed to request NWS recent observations")?
+            .error_for_status()
+            .context("NWS recent observations request failed")?
+            .text()
+            .await
+            .context("failed to read NWS recent observations body")?;
+        write_text(&path, &body)?;
+        let _ = station;
+        Ok(CurrentFetchResult {
+            path: path.display().to_string(),
+            byte_count: body.len(),
+            reused: false,
+        })
+    }
+
+    pub async fn fetch_hourly_forecast(
+        &self,
+        station: &StationRecord,
+        refresh: bool,
+    ) -> Result<CurrentFetchResult> {
+        let today = Utc::now().date_naive();
+        let path = self.cache.current_raw_path(
+            self.source(),
+            &station.station_id,
+            today,
+            "forecast-hourly",
+            "json",
+        );
+        if path.exists() && !refresh {
+            let byte_count = fs::metadata(&path)?.len() as usize;
+            return Ok(CurrentFetchResult {
+                path: path.display().to_string(),
+                byte_count,
+                reused: true,
+            });
+        }
+        let points_url = Self::points_url(station.latitude, station.longitude);
+        let points = self
+            .http
+            .get(&points_url)
+            .send()
+            .await
+            .context("failed to request NWS points lookup")?
+            .error_for_status()
+            .context("NWS points lookup failed")?
+            .json::<NwsPointsResponse>()
+            .await
+            .context("failed to deserialize NWS points lookup")?;
+        let forecast_url = points.properties.forecast_hourly;
+        let body = self
+            .http
+            .get(&forecast_url)
+            .send()
+            .await
+            .context("failed to request NWS hourly forecast")?
+            .error_for_status()
+            .context("NWS hourly forecast request failed")?
+            .text()
+            .await
+            .context("failed to read NWS hourly forecast body")?;
+        write_text(&path, &body)?;
+        Ok(CurrentFetchResult {
+            path: path.display().to_string(),
+            byte_count: body.len(),
+            reused: false,
+        })
+    }
+
+    pub fn parse_hourly_forecast(&self, path: &Path) -> Result<Vec<NwsHourlyForecastPeriod>> {
+        let payload = read_json::<NwsHourlyForecastResponse>(path)?;
+        Ok(payload.properties.periods)
     }
 }
 
@@ -451,47 +563,34 @@ impl WeatherSourceAdapter for NwsApiAdapter {
             .timezone
             .parse()
             .with_context(|| format!("unsupported timezone {}", station.timezone))?;
-        let payload = read_json::<NwsObservationResponse>(path)?;
-        let observed_utc = DateTime::parse_from_rfc3339(&payload.properties.timestamp)
-            .context("failed to parse NWS observation timestamp")?
-            .with_timezone(&Utc);
-        let observed_local = observed_utc.with_timezone(&timezone).fixed_offset();
-        let mut observation = ObservationRecord::from_parts(
-            station.station_id.clone(),
-            DataSource::NwsApi,
-            payload.properties.station_id.clone(),
-            observed_local,
-            path.display().to_string(),
-        );
-        observation.temperature_c = payload.properties.temperature.value;
-        observation.dewpoint_c = payload.properties.dewpoint.value;
-        observation.relative_humidity_pct = payload.properties.relative_humidity.value;
-        observation.wind_direction_deg = payload.properties.wind_direction.value;
-        observation.wind_speed_kt = payload.properties.wind_speed.value.map(kmh_to_knots);
-        observation.wind_gust_kt = payload.properties.wind_gust.value.map(kmh_to_knots);
-        observation.pressure_hpa = payload.properties.barometric_pressure.value.map(pa_to_hpa);
-        observation.sea_level_pressure_hpa =
-            payload.properties.sea_level_pressure.value.map(pa_to_hpa);
-        observation.visibility_km = payload.properties.visibility.value.map(meters_to_km);
-        observation.precipitation_mm = payload.properties.precipitation_last_3_hours.value;
-        observation.text_description = Some(payload.properties.text_description);
-        if let Some(layer) = payload.properties.cloud_layers.first() {
-            observation.cloud_cover_code = Some(layer.amount.clone());
-            observation.cloud_cover_fraction = cloud_fraction_from_code(&layer.amount);
+        let payload = read_json::<Value>(path)?;
+        let observations = if let Some(features) = payload.get("features").and_then(|value| value.as_array()) {
+            let mut observations = Vec::new();
+            for feature in features {
+                let properties: NwsObservationProperties = serde_json::from_value(
+                    feature
+                        .get("properties")
+                        .cloned()
+                        .context("NWS observation feature missing properties")?,
+                )
+                .context("failed to parse NWS observation properties")?;
+                observations.push(
+                    nws_observation_from_properties(properties, station, timezone, path)?,
+                );
+            }
+            observations
         } else {
-            observation
-                .quality_flags
-                .push(QualityFlag::MissingCloudCover);
-        }
-        if let (Some(direction), Some(speed)) =
-            (observation.wind_direction_deg, observation.wind_speed_kt)
-        {
-            let (u, v) = wind_components_knots(direction, speed);
-            observation.wind_u_kt = Some(u);
-            observation.wind_v_kt = Some(v);
-        }
-        debug!(station = %station.station_id, path = %path.display(), "normalized NWS latest observation");
-        Ok(vec![observation])
+            let payload = serde_json::from_value::<NwsObservationResponse>(payload)
+                .context("failed to parse NWS latest observation JSON")?;
+            vec![nws_observation_from_properties(
+                payload.properties,
+                station,
+                timezone,
+                path,
+            )?]
+        };
+        debug!(station = %station.station_id, path = %path.display(), count = observations.len(), "normalized NWS observation payload");
+        Ok(observations)
     }
 }
 
@@ -806,6 +905,51 @@ struct NwsObservationResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct NwsObservationCollectionResponse {
+    features: Vec<NwsObservationFeature>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsObservationFeature {
+    properties: NwsObservationProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsPointsResponse {
+    properties: NwsPointsProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsPointsProperties {
+    #[serde(rename = "forecastHourly")]
+    forecast_hourly: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsHourlyForecastResponse {
+    properties: NwsHourlyForecastProperties,
+}
+
+#[derive(Debug, Deserialize)]
+struct NwsHourlyForecastProperties {
+    periods: Vec<NwsHourlyForecastPeriod>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NwsHourlyForecastPeriod {
+    pub number: u32,
+    #[serde(rename = "startTime")]
+    pub start_time: String,
+    #[serde(rename = "endTime")]
+    pub end_time: String,
+    pub temperature: i32,
+    #[serde(rename = "temperatureUnit")]
+    pub temperature_unit: String,
+    #[serde(rename = "shortForecast")]
+    pub short_forecast: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct NwsObservationProperties {
     #[serde(rename = "stationId")]
     station_id: String,
@@ -836,6 +980,52 @@ struct NwsObservationProperties {
 #[derive(Debug, Deserialize)]
 struct NwsCloudLayer {
     amount: String,
+}
+
+fn nws_observation_from_properties(
+    properties: NwsObservationProperties,
+    station: &StationRecord,
+    timezone: Tz,
+    path: &Path,
+) -> Result<ObservationRecord> {
+    let observed_utc = DateTime::parse_from_rfc3339(&properties.timestamp)
+        .context("failed to parse NWS observation timestamp")?
+        .with_timezone(&Utc);
+    let observed_local = observed_utc.with_timezone(&timezone).fixed_offset();
+    let mut observation = ObservationRecord::from_parts(
+        station.station_id.clone(),
+        DataSource::NwsApi,
+        properties.station_id.clone(),
+        observed_local,
+        path.display().to_string(),
+    );
+    observation.temperature_c = properties.temperature.value;
+    observation.dewpoint_c = properties.dewpoint.value;
+    observation.relative_humidity_pct = properties.relative_humidity.value;
+    observation.wind_direction_deg = properties.wind_direction.value;
+    observation.wind_speed_kt = properties.wind_speed.value.map(kmh_to_knots);
+    observation.wind_gust_kt = properties.wind_gust.value.map(kmh_to_knots);
+    observation.pressure_hpa = properties.barometric_pressure.value.map(pa_to_hpa);
+    observation.sea_level_pressure_hpa = properties.sea_level_pressure.value.map(pa_to_hpa);
+    observation.visibility_km = properties.visibility.value.map(meters_to_km);
+    observation.precipitation_mm = properties.precipitation_last_3_hours.value;
+    observation.text_description = Some(properties.text_description);
+    if let Some(layer) = properties.cloud_layers.first() {
+        observation.cloud_cover_code = Some(layer.amount.clone());
+        observation.cloud_cover_fraction = cloud_fraction_from_code(&layer.amount);
+    } else {
+        observation
+            .quality_flags
+            .push(QualityFlag::MissingCloudCover);
+    }
+    if let (Some(direction), Some(speed)) =
+        (observation.wind_direction_deg, observation.wind_speed_kt)
+    {
+        let (u, v) = wind_components_knots(direction, speed);
+        observation.wind_u_kt = Some(u);
+        observation.wind_v_kt = Some(v);
+    }
+    Ok(observation)
 }
 
 #[derive(Debug, Deserialize)]
