@@ -481,6 +481,22 @@ fn effective_as_of_label(
     None
 }
 
+fn coverage_gap_note(
+    target_profile: Option<&DayProfile>,
+    requested_as_of: Option<chrono::NaiveTime>,
+) -> Option<String> {
+    let requested_hour = requested_as_of.map(|time| time.hour() as u8)?;
+    let latest_hour = target_profile.and_then(latest_observed_hour_local)?;
+    if latest_hour >= requested_hour {
+        return None;
+    }
+    Some(format!(
+        "requested as-of {} but target profile only has observations through {:02}:00 local",
+        requested_as_of?.format("%H:%M"),
+        latest_hour
+    ))
+}
+
 fn seasonal_distance(left_ordinal: i32, right_ordinal: i32) -> i32 {
     let raw = (left_ordinal - right_ordinal).abs();
     raw.min(366 - raw)
@@ -1019,10 +1035,23 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         ensure_today_current_data(app, &station_id).await?;
     }
     ensure_derived(app, &station_id, target_date.year()).await?;
-    let daily = load_all_daily(app, &station_id)?;
-    let profiles = load_all_profiles(app, &station_id)?;
-    let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
-    let as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
+    let mut daily = load_all_daily(app, &station_id)?;
+    let mut profiles = load_all_profiles(app, &station_id)?;
+    let mut target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    let mut as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
+    let required_hours = minimum_analog_hours(as_of_hour);
+    maybe_rehydrate_sparse_historical_target(
+        app,
+        &station_id,
+        target_date,
+        target_profile.as_ref(),
+        required_hours,
+    )
+    .await?;
+    daily = load_all_daily(app, &station_id)?;
+    profiles = load_all_profiles(app, &station_id)?;
+    target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
     let as_of_label = effective_as_of_label(target_date, args.as_of, target_profile.as_ref());
     let breakdown = build_probability_breakdown(
         station_id.clone(),
@@ -1049,6 +1078,7 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
     let quality_note = target_profile.as_ref().and_then(|profile| {
         quality_note_for_day(profile.observed_hour_count, &profile.source_slugs)
     });
+    let status_note = coverage_gap_note(target_profile.as_ref(), args.as_of);
 
     if format == OutputFormat::Json {
         let output = json!({
@@ -1056,6 +1086,7 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
             "as_of": as_of_label,
             "freshness_note": freshness_note,
             "quality_note": quality_note,
+            "status_note": status_note,
         });
         print_json(&output)?;
     } else {
@@ -1110,6 +1141,9 @@ async fn query_probability(format: OutputFormat, app: &App, args: ProbabilityArg
         if let Some(quality_note) = quality_note {
             println!("quality: {quality_note}");
         }
+        if let Some(status_note) = status_note {
+            println!("status: {status_note}");
+        }
     }
     Ok(())
 }
@@ -1126,15 +1160,29 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
         ensure_today_current_data(app, &station_id).await?;
     }
     ensure_derived(app, &station_id, target_date.year()).await?;
-    let daily = load_all_daily(app, &station_id)?;
-    let profiles = load_all_profiles(app, &station_id)?;
-    let target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
-    let as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
+    let mut daily = load_all_daily(app, &station_id)?;
+    let mut profiles = load_all_profiles(app, &station_id)?;
+    let mut target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    let mut as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
+    let required_hours = minimum_analog_hours(as_of_hour);
+    maybe_rehydrate_sparse_historical_target(
+        app,
+        &station_id,
+        target_date,
+        target_profile.as_ref(),
+        required_hours,
+    )
+    .await?;
+    daily = load_all_daily(app, &station_id)?;
+    profiles = load_all_profiles(app, &station_id)?;
+    target_profile = resolve_target_profile(app, &station_id, target_date, &profiles)?;
+    as_of_hour = effective_as_of_hour(target_date, args.as_of, target_profile.as_ref());
     let as_of_label = effective_as_of_label(target_date, args.as_of, target_profile.as_ref());
     let freshness_note = current_day_freshness_note(app, &station_id, target_date)?;
     let quality_note = target_profile
         .as_ref()
         .and_then(|profile| quality_note_for_day(profile.observed_hour_count, &profile.source_slugs));
+    let status_note = coverage_gap_note(target_profile.as_ref(), args.as_of);
     let thresholds = (args.min_high..=args.max_high + 1).collect::<Vec<_>>();
 
     let mut combined_survival = Vec::new();
@@ -1265,6 +1313,7 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
         "top_n": args.top,
         "quality_state": display_breakdown.as_ref().map(|breakdown| breakdown.quality_state.clone()).unwrap_or_else(|| "normal".to_owned()),
         "quality_note": quality_note,
+        "status_note": status_note,
         "freshness_note": freshness_note,
         "combined": {
             "most_likely_high_f": combined_summary["most_likely_high_f"].clone(),
@@ -1291,6 +1340,9 @@ async fn query_likely_high(format: OutputFormat, app: &App, args: LikelyHighArgs
         );
         if let Some(quality_note) = output["quality_note"].as_str() {
             println!("quality: {quality_note}");
+        }
+        if let Some(status_note) = output["status_note"].as_str() {
+            println!("status: {status_note}");
         }
         if let Some(freshness_note) = output["freshness_note"].as_str() {
             println!("freshness: {freshness_note}");
@@ -2076,6 +2128,79 @@ fn read_observations_for_date(
         .into_iter()
         .filter(|observation| observation.local_date == target_date)
         .collect())
+}
+
+async fn hydrate_source_date(
+    app: &App,
+    station_id: &StationId,
+    source: DataSource,
+    target_date: NaiveDate,
+) -> Result<()> {
+    let adapter = app.sources.adapter(source);
+    let station = adapter.fetch_station_metadata(station_id).await?;
+    let raw = adapter
+        .fetch_historical(station_id, target_date, target_date, true)
+        .await?;
+    let observations = adapter.normalize_raw_file(Path::new(&raw.path), &station)?;
+    let year = target_date.year();
+    let normalized_path = app.cache.normalized_path(source, station_id, year);
+    let _added = merge_observations_into_year(&normalized_path, observations)?;
+    let merged_observations = read_observation_records(&normalized_path)?;
+    write_normalized_manifest(
+        app,
+        source,
+        station_id,
+        year,
+        &normalized_path,
+        &merged_observations,
+        input_paths_for_year(source, station_id, year, app)?,
+    )?;
+    Ok(())
+}
+
+async fn hydrate_historical_target_date(
+    app: &App,
+    station_id: &StationId,
+    target_date: NaiveDate,
+) -> Result<()> {
+    for source in [DataSource::NceiAsosFiveMinute, DataSource::IemAsosOneMinute] {
+        if let Err(error) = hydrate_source_date(app, station_id, source, target_date).await {
+            warn!(
+                station = %station_id,
+                date = %target_date,
+                source = source.slug(),
+                error = %error,
+                "historical source hydration failed"
+            );
+        }
+    }
+    build_daily(app, station_id, Some(target_date.year())).await?;
+    build_profiles(app, station_id, Some(target_date.year())).await?;
+    Ok(())
+}
+
+async fn maybe_rehydrate_sparse_historical_target(
+    app: &App,
+    station_id: &StationId,
+    target_date: NaiveDate,
+    target_profile: Option<&DayProfile>,
+    required_hours: usize,
+) -> Result<()> {
+    if target_date == Local::now().date_naive() {
+        return Ok(());
+    }
+    let observed_hours = target_profile.map(|profile| profile.observed_hour_count).unwrap_or(0);
+    if observed_hours >= required_hours {
+        return Ok(());
+    }
+    info!(
+        station = %station_id,
+        date = %target_date,
+        observed_hours,
+        required_hours,
+        "historical target is sparse; hydrating date from upstream sources"
+    );
+    hydrate_historical_target_date(app, station_id, target_date).await
 }
 
 fn write_daily_summaries(path: &Path, summaries: &[DailySummary]) -> Result<()> {
